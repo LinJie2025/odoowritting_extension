@@ -2,6 +2,7 @@
   "name": "odoowritting-extension",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Odoo Excel Importer - Chrome Extension for importing Excel data into Odoo RFQ order lines",
   "scripts": {
     "prepare": "husky",
