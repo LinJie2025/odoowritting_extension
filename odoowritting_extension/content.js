@@ -131,7 +131,20 @@
       return "0.9总价不一致：计算 " + expr + " = " + fmtNum(computed) + " ≠ Excel " + fmtNum(old)
     },
     boxQtyEmpty: "abw交货箱数为空或 0，标记缺货",
-    outstock: "Excel 有该 UPC/Catalog，但 PDF 中不存在"
+    outstock: "Excel 有该 UPC/Catalog，但 PDF 中不存在",
+    // Excel 入口：Excel 值 vs Odoo 现有值比对（2026-08-18）
+    excelBoxQty: function (newVal, oldVal) {
+      return "abw交货箱数不一致：Excel " + fmtNum(newVal) + " ≠ Odoo " + fmtNum(oldVal)
+    },
+    excelUnitPrice: function (newVal, oldVal) {
+      return "单价不一致：Excel " + fmtNum(newVal) + " ≠ Odoo " + fmtNum(oldVal)
+    },
+    excelBoxPrice09: function (newVal, oldVal) {
+      return "0.9箱规价不一致：Excel " + fmtNum(newVal) + " ≠ Odoo " + fmtNum(oldVal)
+    },
+    excelRemark: function (newVal, oldVal) {
+      return "备注不一致：Excel「" + newVal + "」≠ Odoo「" + oldVal + "」"
+    }
   }
 
   // 计算表达式展示（factor=1 时省略 ×1）
@@ -194,7 +207,7 @@
       model: "purchase.order.line", method: "search_read",
       args: [], kwargs: {
         domain: [["id", "in", ids]],
-        fields: ["id", "name", "price_unit", "box_wholesale_price", "remark"]
+        fields: ["id", "name", "price_unit", "box_wholesale_price", "remark", "product_packaging_qty"]
       }
     })
     return result.map(function (r) {
@@ -202,6 +215,7 @@
       return {
         id: r.id, name: r.name, upc: m ? m[1] : "",
         price_unit: r.price_unit, box_wholesale_price: r.box_wholesale_price,
+        packaging_qty: r.product_packaging_qty,
         remark: r.remark || ""
       }
     })
@@ -759,6 +773,73 @@
     return changes
   }
 
+  // ── Excel 入口（2026-08-18）：无 PDF，写回目标 = Excel 现有值；比对 Odoo 订单行现有值 ──
+  // 单件：abw交货箱数 + 单价 + 备注；套装：+ 0.9箱规价（用户确认）
+  // lineMap: { ref|upc: {id, name, price_unit, box_wholesale_price, packaging_qty, remark} }
+  function applyExcelChanges(excelRows, lineMap, mode) {
+    var changes = []
+    for (var i = 0; i < excelRows.length; i++) {
+      var ex = excelRows[i]
+      var line = lineMap[ex.orderRef + "|" + ex.upc] || null
+      var fields = []
+      var odooRaw = line ? "Odoo 行: " + line.name : ""   // 悬浮第一行（替换 PDF 流的 pdfRaw 位）
+
+      // abw交货箱数（单件/套装都写回 product_packaging_qty）
+      var newBoxQty = ex.boxQty
+      var oldBoxQty = line ? line.packaging_qty : null
+      var boxQtyChanged = newBoxQty !== null && !numEq(oldBoxQty, newBoxQty)
+      fields.push({
+        key: "boxQty", label: "abw交货箱数", odooField: ODOO_FIELDS.boxQty,
+        oldValue: oldBoxQty, newValue: newBoxQty, changed: boxQtyChanged,
+        reason: boxQtyChanged ? REASONS.excelBoxQty(newBoxQty, oldBoxQty) : null,
+        pdfRaw: odooRaw
+      })
+
+      // 单价（单件/套装都写回 price_unit）
+      var newUnit = ex.unitPrice
+      var oldUnit = line ? line.price_unit : null
+      var unitChanged = newUnit !== null && !numEq(oldUnit, newUnit)
+      fields.push({
+        key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice,
+        oldValue: oldUnit, newValue: newUnit, changed: unitChanged,
+        reason: unitChanged ? REASONS.excelUnitPrice(newUnit, oldUnit) : null,
+        pdfRaw: odooRaw
+      })
+
+      // 0.9箱规价（仅套装写回 box_wholesale_price）
+      if (mode === "set") {
+        var newBox09 = ex.boxPrice09
+        var oldBox09 = line ? line.box_wholesale_price : null
+        var box09Changed = newBox09 !== null && !numEq(oldBox09, newBox09)
+        fields.push({
+          key: "boxPrice09", label: "0.9箱规价", odooField: ODOO_FIELDS.boxWholesalePrice,
+          oldValue: oldBox09, newValue: newBox09, changed: box09Changed,
+          reason: box09Changed ? REASONS.excelBoxPrice09(newBox09, oldBox09) : null,
+          pdfRaw: odooRaw
+        })
+      }
+
+      // 备注（仅 Excel 有值时写回，避免空值清空 Odoo 备注）
+      if (ex.remark) {
+        var oldRemark = line ? (line.remark || "") : ""
+        var remarkChanged = oldRemark !== ex.remark
+        fields.push({
+          key: "remark", label: "备注", odooField: ODOO_FIELDS.remark,
+          oldValue: oldRemark, newValue: ex.remark, changed: remarkChanged,
+          reason: remarkChanged ? REASONS.excelRemark(ex.remark, oldRemark) : null,
+          pdfRaw: odooRaw
+        })
+      }
+
+      changes.push({
+        kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef,
+        qtyTarget: null, qtySum: null, qtyMismatch: false, mode: mode,
+        fields: fields
+      })
+    }
+    return changes
+  }
+
   // ═══════════════════════════════════════════
   //  业务逻辑（Excel 导入流匹配/预览逻辑已移除，待重新对齐后重写）
   // ═══════════════════════════════════════════
@@ -792,7 +873,8 @@
   //  App 状态
   // ═══════════════════════════════════════════
   var appState = {
-    cardOpen: false
+    cardOpen: false,
+    activeTab: "excel"      // 'excel' | 'pdf'（双 Tab，2026-08-18 恢复）
   }
 
   // PDF 修正入口模式（单件 / 套装，处理逻辑区分）
@@ -812,6 +894,15 @@
     excelFileName: null,
     changes: null,       // 匹配修改结果（每条带 mode 标记）
     error: null          // 当前步骤错误信息（常驻显示，下次成功时清除）
+  }
+
+  // Excel 导入区流程状态（2026-08-18 新增：上传 Excel → 比对 Odoo 现有值 → 预览写回）
+  var excelState = {
+    mode: null,          // 入口: null | 'single' | 'set'
+    excelRows: null,     // Excel 解析结果
+    excelFileName: null,
+    changes: null,       // applyExcelChanges 结果（含 lineMap 比对）
+    error: null
   }
 
   // ═══════════════════════════════════════════
@@ -916,7 +1007,7 @@
       btn.style.cursor = "grab"
       btn.textContent = "📥"
       var file = e.dataTransfer.files[0]
-      if (file) showToast("请在卡片内选择入口上传文件（Excel 导入逻辑待重新设计）", "info")
+      if (file) showToast("请在卡片内选择入口上传文件（📊 Excel 导入 / 📄 PDF 修正）", "info")
     })
 
     return btn
@@ -1031,6 +1122,12 @@
 
   function renderCardContent() {
     var frag = document.createDocumentFragment()
+    var isExcelTab = appState.activeTab === "excel"
+    var titleText = isExcelTab ? "Excel 导入" : "PDF 修正"
+    if (isExcelTab ? excelState.mode : pdfState.mode) {
+      var m = PDF_MODES[isExcelTab ? excelState.mode : pdfState.mode]
+      titleText += " · " + m.label
+    }
 
     // Header
     frag.appendChild(el("div", {
@@ -1038,8 +1135,7 @@
     }, [
       el("div", { style: "display:flex;align-items:center;gap:8px" }, [
         el("span", { style: "font-size:11px;color:#6b7280;background:#f3f4f6;padding:2px 6px;border-radius:4px" }, "采购结果"),
-        el("span", { style: "font-size:15px;font-weight:600;color:#111827" },
-          "PDF 修正" + (pdfState.mode ? " · " + PDF_MODES[pdfState.mode].label : ""))
+        el("span", { style: "font-size:15px;font-weight:600;color:#111827" }, titleText)
       ]),
       el("button", {
         onclick: function () { closeCard(document.getElementById(PREFIX + "btn")) },
@@ -1047,8 +1143,12 @@
       }, "✕")
     ]))
 
-    // PDF 修正区（唯一入口）
-    frag.appendChild(renderPdfZone())
+    // Tab 栏：📊 Excel 导入 / 📄 PDF 修正
+    frag.appendChild(renderTabSwitch())
+
+    // 内容区（按 Tab 路由）
+    if (isExcelTab) frag.appendChild(renderExcelZone())
+    else frag.appendChild(renderPdfZone())
 
     // 日志区 (有日志才显示)
     var log = getLog()
@@ -1065,6 +1165,29 @@
   // ═══════════════════════════════════════════
   //  3. 上传区（Excel 导入 Tab 已移除，只保留 PDF 修正入口）
   // ═══════════════════════════════════════════
+
+  // ═══════════════════════════════════════════
+  //  3. Tab 栏（📊 Excel 导入 / 📄 PDF 修正，2026-08-18 恢复双 Tab）
+  // ═══════════════════════════════════════════
+  function renderTabSwitch() {
+    var bar = el("div", { style: "display:flex;padding:10px 16px 0;gap:8px" })
+    var tabs = [
+      { id: "excel", label: "📊 Excel 导入" },
+      { id: "pdf", label: "📄 PDF 修正" }
+    ]
+    for (var i = 0; i < tabs.length; i++) {
+      (function (t) {
+        var active = appState.activeTab === t.id
+        bar.appendChild(el("div", {
+          onclick: function () { appState.activeTab = t.id; refreshCard() },
+          style: "flex:1;text-align:center;padding:8px 6px;border-radius:8px;font-size:12px;cursor:pointer;font-weight:600;color:" +
+            (active ? "#7c3aed" : "#6b7280") + ";background:" + (active ? "#f5f3ff" : "#f9fafb") +
+            ";border:1px solid " + (active ? "#ddd6fe" : "#e5e7eb") + ";transition:background 0.15s,border-color 0.15s"
+        }, t.label))
+      })(tabs[i])
+    }
+    return bar
+  }
 
   // ═══════════════════════════════════════════
   //  3b. PDF 区 UI
@@ -1143,7 +1266,7 @@
 
     if (!pdfState.mode) {
       // 步骤0：选择修正入口（单件 / 套装）
-      wrap.appendChild(renderPdfModePicker())
+      wrap.appendChild(renderModePicker(selectPdfMode))
     } else if (!pdfState.pdfRows) {
       // 步骤1：上传 PDF
       wrap.appendChild(makeDropZone("点击上传或拖拽 PDF", "支持 .pdf（文本型，非扫描件）", "📄", "pdf", function (file) { processPdfFile(file) }))
@@ -1167,8 +1290,8 @@
     return wrap
   }
 
-  // 入口选择器：单件 / 套装（选中后走各自处理逻辑）
-  function renderPdfModePicker() {
+  // 入口选择器：单件 / 套装（PDF/Excel 两流共用，onSelect 接收 modeId）
+  function renderModePicker(onSelect) {
     var wrap = el("div", { style: "display:flex;flex-direction:column;gap:8px" }, [
       el("div", { style: "font-size:12px;color:#374151;font-weight:600" }, "请选择修正入口")
     ])
@@ -1178,7 +1301,7 @@
       (function (mid) {
         var m = PDF_MODES[mid]
         var btn = el("div", {
-          onclick: function () { selectPdfMode(mid) },
+          onclick: function () { onSelect(mid) },
           style: "flex:1;padding:14px 10px;border:2px solid #e5e7eb;border-radius:10px;text-align:center;cursor:pointer;transition:border-color 0.2s,background 0.2s"
         }, [
           el("div", { style: "font-size:26px;margin-bottom:6px" }, m.icon),
@@ -1266,6 +1389,83 @@
 
   function resetPdfState() {
     clearPdfData()
+    refreshCard()
+  }
+
+  // ═══════════════════════════════════════════
+  //  3c. Excel 导入区 UI（2026-08-18：上传 Excel → 比对 Odoo 现有值 → 预览写回）
+  // ═══════════════════════════════════════════
+  function renderExcelZone() {
+    var wrap = el("div", { style: "margin:12px 16px;display:flex;flex-direction:column;gap:10px" })
+
+    // 当前入口徽章（可切换）
+    if (excelState.mode) {
+      var m = PDF_MODES[excelState.mode]
+      wrap.appendChild(el("div", {
+        style: "display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#7c3aed;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px;padding:8px 10px"
+      }, [
+        el("span", {}, m.icon + " 当前入口：" + m.label),
+        el("span", {
+          onclick: function () { resetExcelState() },
+          style: "cursor:pointer;text-decoration:underline;color:#6b7280"
+        }, "切换入口")
+      ]))
+    }
+
+    // 常驻错误提示
+    if (excelState.error) {
+      wrap.appendChild(el("div", {
+        style: "font-size:12px;color:#dc2626;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:8px 10px;line-height:1.5"
+      }, "⚠️ " + excelState.error))
+    }
+
+    // 状态提示
+    if (excelState.excelRows) {
+      wrap.appendChild(el("div", {
+        style: "font-size:12px;color:#059669;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px 10px"
+      }, "✅ Excel 已解析：" + (excelState.excelFileName || "") + "（" + excelState.excelRows.length + " 行）"))
+    }
+
+    if (!excelState.mode) {
+      // 步骤0：选择入口（单件 / 套装，与 PDF 区共用选择器）
+      wrap.appendChild(renderModePicker(selectExcelMode))
+    } else if (!excelState.excelRows) {
+      // 步骤1：上传 Excel
+      wrap.appendChild(makeDropZone("请上传采购订单 Excel", "支持 .xlsx / .xls", "📊", "excel", function (file) { processExcelFile(file) }))
+    } else {
+      // 步骤2：预览（比对 Odoo 现有值）+ 重置
+      var btnRow = el("div", { style: "display:flex;gap:8px" }, [
+        el("button", {
+          onclick: function () { previewExcelChanges() },
+          style: "flex:1;padding:10px;border:none;border-radius:8px;background:#7c3aed;color:#fff;font-size:13px;font-weight:600;cursor:pointer"
+        }, "👁 预览修改"),
+        el("button", {
+          onclick: function () { resetExcelState() },
+          style: "padding:10px 14px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#6b7280;font-size:13px;cursor:pointer"
+        }, "重置")
+      ])
+      wrap.appendChild(btnRow)
+    }
+    return wrap
+  }
+
+  function selectExcelMode(modeId) {
+    if (!PDF_MODES[modeId]) return
+    clearExcelData()
+    excelState.mode = modeId
+    refreshCard()
+  }
+
+  function clearExcelData() {
+    excelState.mode = null
+    excelState.excelRows = null
+    excelState.excelFileName = null
+    excelState.changes = null
+    excelState.error = null
+  }
+
+  function resetExcelState() {
+    clearExcelData()
     refreshCard()
   }
 
@@ -1416,12 +1616,56 @@
     }
   }
 
-  // 构建 PDF 区预览行（含 Odoo 订单行匹配）
-  async function buildPdfPreviewRows(changes) {
-    var orderRefs = {}
-    for (var i = 0; i < changes.length; i++) {
-      if (changes[i].orderRef) orderRefs[changes[i].orderRef] = true
+  // ── Excel 导入流：上传 Excel → 解析 → 预览（比对 Odoo 现有值）──
+  async function processExcelFile(file) {
+    try {
+      excelState.error = null
+      var data = await file.arrayBuffer()
+      var excelRows = parseOrderExcel(data)
+      if (!excelRows.length) {
+        excelState.error = "Excel 中没有有效数据"
+        refreshCard()
+        showToast(excelState.error, "error")
+        return
+      }
+      excelState.excelRows = excelRows
+      excelState.excelFileName = file.name
+      excelState.changes = null
+      refreshCard()
+      showToast("Excel 解析成功：" + excelRows.length + " 行，可点击预览", "success")
+    } catch (err) {
+      excelState.error = err.message || String(err)
+      refreshCard()
+      showToast("Excel 解析失败: " + excelState.error, "error")
+      console.error("[Odoo Excel]", err)
     }
+  }
+
+  // 预览：查 Odoo 订单行 → Excel 值 vs Odoo 现有值比对 → Modal（可编辑，不一致悬浮显示）
+  async function previewExcelChanges() {
+    if (!excelState.excelRows) return
+    try {
+      showToast("查询 Odoo 订单行中...", "info")
+      var orderRefs = {}
+      for (var i = 0; i < excelState.excelRows.length; i++) {
+        if (excelState.excelRows[i].orderRef) orderRefs[excelState.excelRows[i].orderRef] = true
+      }
+      var lineMap = await loadOrderLineMap(orderRefs)
+      var changes = applyExcelChanges(excelState.excelRows, lineMap, excelState.mode)
+      excelState.changes = changes
+      var previewRows = buildPreviewRows(changes, lineMap)
+      updateLoadingOverlay(null)
+      var modeLabel = excelState.mode ? "[" + PDF_MODES[excelState.mode].label + "] " : ""
+      buildPdfPreviewModal(previewRows, modeLabel + excelState.excelFileName, "excel")
+    } catch (err) {
+      updateLoadingOverlay(null)
+      showToast("预览失败: " + (err.message || err), "error")
+      console.error("[Odoo Excel]", err)
+    }
+  }
+
+  // 查订单关联 → PO → 订单行，构建 lineMap（key = ref|upc，两流共用）
+  async function loadOrderLineMap(orderRefs) {
     var lineMap = {}
     var refs = Object.keys(orderRefs)
     for (var r = 0; r < refs.length; r++) {
@@ -1435,10 +1679,24 @@
           }
         }
       } catch (e) {
-        console.error("[Odoo PDF] 查询失败 " + ref, e)
+        console.error("[Odoo Excel Importer] 查询失败 " + ref, e)
       }
     }
+    return lineMap
+  }
 
+  // 构建 PDF 区预览行（含 Odoo 订单行匹配）
+  async function buildPdfPreviewRows(changes) {
+    var orderRefs = {}
+    for (var i = 0; i < changes.length; i++) {
+      if (changes[i].orderRef) orderRefs[changes[i].orderRef] = true
+    }
+    var lineMap = await loadOrderLineMap(orderRefs)
+    return buildPreviewRows(changes, lineMap)
+  }
+
+  // changes + lineMap → 预览行（PDF/Excel 两流共用；lineMap 已查好时直接走此函数）
+  function buildPreviewRows(changes, lineMap) {
     var previewRows = []
     for (var k = 0; k < changes.length; k++) {
       var c = changes[k]
@@ -1488,8 +1746,13 @@
     }
   }
 
-  // 字段展示顺序（按入口）
-  function fieldOrder(mode) {
+  // 字段展示顺序（按入口 + 来源；Excel 流无 PDF 比对列 boxPrice/total09）
+  function fieldOrder(mode, source) {
+    if (source === "excel") {
+      var order = ["boxQty", "unitPrice"]
+      if (mode === "set") order = order.concat(["boxPrice09"])
+      return order.concat(["remark"])
+    }
     var order = ["boxQty", "unitPrice"]
     if (mode === "set") order = order.concat(["boxPrice", "boxPrice09", "total09"])
     return order.concat(["remark"])
@@ -1510,9 +1773,12 @@
     return (v === null || v === undefined || v === "") ? "" : String(v)
   }
 
-  function buildPdfPreviewModal(previewRows, fileName) {
+  // source: 'pdf' | 'excel'（2026-08-18 双流共用：Excel 流无 PDF 比对，标题/字段列布局按 source 区分）
+  function buildPdfPreviewModal(previewRows, fileName, source) {
     removeModals()
-    var mode = pdfState.mode
+    source = source || "pdf"
+    var mode = source === "excel" ? excelState.mode : pdfState.mode
+    var titleIcon = source === "excel" ? "📊" : "📄"
     // 去重订单关联号列表（2026-08-18 用户要求：显示具体关联号，如 P00393|P00395|...）
     var refSet = {}
     for (var ri = 0; ri < previewRows.length; ri++) {
@@ -1531,7 +1797,7 @@
     overlay.appendChild(modal)
 
     // Header
-    var h2Title = el("h2", { style: "margin:0;font-size:16px;color:#111827;flex:1;min-width:0" }, "📄 " + (fileName || "PDF 修正预览"))
+    var h2Title = el("h2", { style: "margin:0;font-size:16px;color:#111827;flex:1;min-width:0" }, titleIcon + " " + (fileName || (source === "excel" ? "Excel 导入预览" : "PDF 修正预览")))
     if (refList.length > 0) {
       h2Title.appendChild(el("span", { style: "color:#7c3aed;font-size:13px;margin-left:10px;font-weight:600;word-break:break-all" }, refList.join(" | ")))
     }
@@ -1556,7 +1822,7 @@
 
     // 表格
     var tableWrap = el("div", { style: "flex:1;overflow:auto;max-height:60vh" })
-    tableWrap.appendChild(renderPdfPreviewTable(previewRows, mode))
+    tableWrap.appendChild(renderPdfPreviewTable(previewRows, mode, source))
     modal.appendChild(tableWrap)
 
     // Footer
@@ -1575,8 +1841,9 @@
     currentModalOverlay = overlay
   }
 
-  function renderPdfPreviewTable(previewRows, mode) {
-    var order = fieldOrder(mode)
+  function renderPdfPreviewTable(previewRows, mode, source) {
+    var order = fieldOrder(mode, source)
+    var isExcel = source === "excel"
     var table = el("table", { style: "width:100%;border-collapse:collapse;font-size:12px" })
     // hover 行高亮（2026-08-18 美化）
     var hoverStyle = document.createElement("style")
@@ -1590,10 +1857,12 @@
       { w: "80px", text: "店铺" },
       { w: "120px", text: "UPC" },
       { w: "90px", text: "订单关联" },
-      { text: "产品名" },
-      { w: "110px", text: "数量核对" },
-      { w: "90px", text: "PDF Qty" }
+      { text: "产品名" }
     ]
+    // PDF 流额外两列：数量核对 + PDF Qty（Excel 流无 PDF 源，不展示）
+    if (!isExcel) {
+      headers.push({ w: "110px", text: "数量核对" }, { w: "90px", text: "PDF Qty" })
+    }
     for (var i = 0; i < order.length; i++) {
       headers.push({ w: "110px", text: FIELD_LABELS[order[i]] })
     }
@@ -1622,12 +1891,12 @@
 
     var tbody = document.createElement("tbody")
     for (var i = 0; i < previewRows.length; i++) {
-      tbody.appendChild(renderPdfPreviewRow(previewRows[i], order, colMaxLen, i))
+      tbody.appendChild(renderPdfPreviewRow(previewRows[i], order, colMaxLen, i, source))
     }
     table.appendChild(tbody)
 
     // 列总和行（2026-08-18 用户需求：所有数值列全表合计，随输入框编辑实时刷新）
-    table.appendChild(renderPdfTotalRow(previewRows, order))
+    table.appendChild(renderPdfTotalRow(previewRows, order, source))
 
     setTimeout(function () {
       var sa = document.getElementById(PREFIX + "pdf_select_all")
@@ -1644,8 +1913,9 @@
     return table
   }
 
-  function renderPdfPreviewRow(row, order, colMaxLen, rowIndex) {
+  function renderPdfPreviewRow(row, order, colMaxLen, rowIndex, source) {
     var tr = document.createElement("tr")
+    var isExcel = source === "excel"
     var alertRow = row.error || row.qtyMismatch || row.kind === "outstock"
     // 交替行色美化；警示行红底优先
     var bg = alertRow ? "#fef2f2" : ((rowIndex || 0) % 2 === 0 ? "#ffffff" : "#f9fafb")
@@ -1671,54 +1941,57 @@
     tr.appendChild(td(row.orderRef || "—", "#374151", null, "font-size:11px"))
     tr.appendChild(td(row.odooLineName || row.catalog || "—", row.error ? "#ef4444" : "#374151"))
 
-    // 数量核对：PDF Qty vs abw交货箱数（多条求和）；一致 ✓ 绿色，不一致红色 + hover 原因（2026-08-18）
-    var qtyTd = document.createElement("td")
-    qtyTd.style.cssText = "padding:6px 8px;font-size:11px;text-align:center;vertical-align:middle;white-space:nowrap"
-    if (row.kind === "outstock") {
-      qtyTd.innerHTML = '<span style="color:#dc2626;font-weight:600;text-decoration:underline dotted;cursor:help">缺货</span>'
-      var osTip = null
-      qtyTd.addEventListener("mouseenter", function () {
-        if (osTip) return
-        osTip = el("div", {
-          style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:6px 10px;border-radius:6px;max-width:340px;line-height:1.5;pointer-events:none"
-        }, REASONS.outstock)
-        document.body.appendChild(osTip)
-        var r = qtyTd.getBoundingClientRect()
-        osTip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - osTip.offsetWidth - 8)) + "px"
-        osTip.style.top = Math.max(8, r.top - osTip.offsetHeight - 8) + "px"
-      })
-      qtyTd.addEventListener("mouseleave", function () {
-        if (osTip) { osTip.remove(); osTip = null }
-      })
-    } else if (row.qtyMismatch) {
-      qtyTd.innerHTML = '<span style="color:#dc2626;font-weight:600;text-decoration:underline dotted;cursor:help">' + fmtNum(row.qtySum) + ' ≠ ' + fmtNum(row.qtyTarget) + '</span>'
-      var qTip = null
-      qtyTd.addEventListener("mouseenter", function () {
-        if (qTip) return
-        qTip = el("div", {
-          style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:8px 10px;border-radius:6px;max-width:340px;line-height:1.5;pointer-events:none"
+    // 数量核对 + PDF Qty 两列（仅 PDF 流；Excel 流无 PDF 源，2026-08-18）
+    if (!isExcel) {
+      // 数量核对：PDF Qty vs abw交货箱数（多条求和）；一致 ✓ 绿色，不一致红色 + hover 原因
+      var qtyTd = document.createElement("td")
+      qtyTd.style.cssText = "padding:6px 8px;font-size:11px;text-align:center;vertical-align:middle;white-space:nowrap"
+      if (row.kind === "outstock") {
+        qtyTd.innerHTML = '<span style="color:#dc2626;font-weight:600;text-decoration:underline dotted;cursor:help">缺货</span>'
+        var osTip = null
+        qtyTd.addEventListener("mouseenter", function () {
+          if (osTip) return
+          osTip = el("div", {
+            style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:6px 10px;border-radius:6px;max-width:340px;line-height:1.5;pointer-events:none"
+          }, REASONS.outstock)
+          document.body.appendChild(osTip)
+          var r = qtyTd.getBoundingClientRect()
+          osTip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - osTip.offsetWidth - 8)) + "px"
+          osTip.style.top = Math.max(8, r.top - osTip.offsetHeight - 8) + "px"
         })
-        // 两行悬浮：第一行 PDF 原始 Qty，第二行对比结果（2026-08-18 用户需求）
-        qTip.innerHTML = '<div style="font-weight:600;margin-bottom:4px;color:#e5e7eb">PDF Qty = ' + escHtml(fmtNum(row.qtyTarget)) + '</div>' +
-          '<div>' + escHtml(REASONS.qtySum(row.qtySum, row.qtyTarget)) + '</div>'
-        document.body.appendChild(qTip)
-        var r = qtyTd.getBoundingClientRect()
-        qTip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - qTip.offsetWidth - 8)) + "px"
-        qTip.style.top = Math.max(8, r.top - qTip.offsetHeight - 8) + "px"
-      })
-      qtyTd.addEventListener("mouseleave", function () {
-        if (qTip) { qTip.remove(); qTip = null }
-      })
-    } else {
-      qtyTd.innerHTML = '<span style="color:#16a34a;font-weight:600">✓ ' + fmtNum(row.qtyTarget) + '</span>'
-    }
-    tr.appendChild(qtyTd)
+        qtyTd.addEventListener("mouseleave", function () {
+          if (osTip) { osTip.remove(); osTip = null }
+        })
+      } else if (row.qtyMismatch) {
+        qtyTd.innerHTML = '<span style="color:#dc2626;font-weight:600;text-decoration:underline dotted;cursor:help">' + fmtNum(row.qtySum) + ' ≠ ' + fmtNum(row.qtyTarget) + '</span>'
+        var qTip = null
+        qtyTd.addEventListener("mouseenter", function () {
+          if (qTip) return
+          qTip = el("div", {
+            style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:8px 10px;border-radius:6px;max-width:340px;line-height:1.5;pointer-events:none"
+          })
+          // 两行悬浮：第一行 PDF 原始 Qty，第二行对比结果（2026-08-18 用户需求）
+          qTip.innerHTML = '<div style="font-weight:600;margin-bottom:4px;color:#e5e7eb">PDF Qty = ' + escHtml(fmtNum(row.qtyTarget)) + '</div>' +
+            '<div>' + escHtml(REASONS.qtySum(row.qtySum, row.qtyTarget)) + '</div>'
+          document.body.appendChild(qTip)
+          var r = qtyTd.getBoundingClientRect()
+          qTip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - qTip.offsetWidth - 8)) + "px"
+          qTip.style.top = Math.max(8, r.top - qTip.offsetHeight - 8) + "px"
+        })
+        qtyTd.addEventListener("mouseleave", function () {
+          if (qTip) { qTip.remove(); qTip = null }
+        })
+      } else {
+        qtyTd.innerHTML = '<span style="color:#16a34a;font-weight:600">✓ ' + fmtNum(row.qtyTarget) + '</span>'
+      }
+      tr.appendChild(qtyTd)
 
-    // PDF Qty 列：PDF 原始 qty 值（= qtyTarget，outstock 无值显示 —，2026-08-18 新增）
-    var pdfQtyTd = document.createElement("td")
-    pdfQtyTd.style.cssText = "padding:6px 8px;font-size:11px;text-align:center;vertical-align:middle;white-space:nowrap;color:#374151"
-    pdfQtyTd.textContent = fmtNum(row.qtyTarget)
-    tr.appendChild(pdfQtyTd)
+      // PDF Qty 列：PDF 原始 qty 值（= qtyTarget，outstock 无值显示 —，2026-08-18 新增）
+      var pdfQtyTd = document.createElement("td")
+      pdfQtyTd.style.cssText = "padding:6px 8px;font-size:11px;text-align:center;vertical-align:middle;white-space:nowrap;color:#374151"
+      pdfQtyTd.textContent = fmtNum(row.qtyTarget)
+      tr.appendChild(pdfQtyTd)
+    }
 
     // 字段输入框 + PDF 来源对照小字 + 不一致原因悬浮（2026-08-18 增强）
     row._inputs = {}
@@ -1801,7 +2074,8 @@
     }
   }
 
-  function renderPdfTotalRow(previewRows, order) {
+  function renderPdfTotalRow(previewRows, order, source) {
+    var isExcel = source === "excel"
     var tfoot = document.createElement("tfoot")
     var tr = document.createElement("tr")
     tr.style.cssText = "background:#f3f4f6"
@@ -1811,12 +2085,14 @@
     tdLabel.style.cssText = "padding:6px 8px;font-size:11px;color:#374151;font-weight:600;text-align:center;white-space:nowrap"
     tdLabel.textContent = "总和（全表合计）"
     tr.appendChild(tdLabel)
-    var tdQty = document.createElement("td")
-    tdQty.style.cssText = "padding:6px 8px;font-size:11px;color:#9ca3af;text-align:center"
-    tr.appendChild(tdQty)
-    var tdPdfQty = document.createElement("td")
-    tdPdfQty.style.cssText = "padding:6px 8px;font-size:11px;color:#9ca3af;text-align:center"
-    tr.appendChild(tdPdfQty)
+    if (!isExcel) {
+      var tdQty = document.createElement("td")
+      tdQty.style.cssText = "padding:6px 8px;font-size:11px;color:#9ca3af;text-align:center"
+      tr.appendChild(tdQty)
+      var tdPdfQty = document.createElement("td")
+      tdPdfQty.style.cssText = "padding:6px 8px;font-size:11px;color:#9ca3af;text-align:center"
+      tr.appendChild(tdPdfQty)
+    }
     var cells = {}
     for (var i = 0; i < order.length; i++) {
       var key = order[i]

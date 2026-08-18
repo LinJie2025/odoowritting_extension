@@ -18,16 +18,16 @@
 
 | 项 | 内容 |
 |---|---|
-| 代码位置 | **只有一个业务文件**：根目录 `content.js`（1866 行，ES5 风格 IIFE，无构建步骤） |
+| 代码位置 | **只有一个业务文件**：根目录 `content.js`（~2200 行，ES5 风格 IIFE，无构建步骤） |
 | 第三方库 | `lib/xlsx.full.min.js`、`lib/pdf.min.js`+`lib/pdf.worker.min.js`（pdfjs-dist 3.11.174 UMD，勿升级 4.x） |
 | 打包副本 | `odoowritting_extension/` 子目录 = Chrome「加载已解压」用产物；**改完根目录必须同步过去** |
 | 字段映射 | 集中在 content.js 顶部 `ODOO_FIELDS`（Odoo 字段名，**2026-08-14 用户确认**：包装数量=`product_packaging_qty`、整箱批发价=`box_wholesale_price`、单价=`price_unit`、备注=`remark`、订单关联=`name`）与 `EXCEL_COLS`（Excel 表头名），**改字段只改这两个常量** |
 | 匹配键 | UPC：Excel「订单行/产品/内部参考号」↔ Odoo 行 name 中 `\[(\d+)\]` ↔ PDF 表 UPC 列 |
-| 两条流程 | ⚠️ **Excel 导入流已整体移除**（2026-08-14，等用户给新规则后重写，Tab 现为占位）；**PDF 修正流在线**：`parseOrderExcel`（按列名）+ `searchPoByRef` + `executePdfUpdate` |
+| 两条流程 | ✅ **双 Tab（v1.6.0）**：📊 **Excel 导入**（上传 Excel → `applyExcelChanges` 比对 Odoo 现有值 → 可编辑 Modal 写回；单件写箱数+单价+备注，套装加 0.9箱规价）+ 📄 **PDF 修正**（上传 PDF+Excel → `applyPdfByMode` 匹配修正 → Modal 写回）；共用 `parseOrderExcel` / `loadOrderLineMap` / `buildPreviewRows` / `buildPdfPreviewModal(source)` / `executePdfUpdate` |
 | 注入条件 | 仅 URL hash 含 `model=purchase.order` 的页面注入按钮 |
 | 价格规则 | 整箱批发价 = PDF Subtotal × 0.9，整数分运算（`calcBoxPrice`） |
-| 套装扣减 | 多条包装数量求和 > PDF Qty 时随机扣减；Excel 有 PDF 无 → 备注「缺货」 |
-| ❌ 未实现 | **PDF 单件入口**：`applyPdfSingleToExcel` 是 throw 占位，**规则已确认（2026-08-14）**：UPC 匹配 + 包装数量求和/随机扣减 + 第2页 Subtotal vs Order Total after Store Credit 决定 Unit Price in HKD 是否 ×0.9（详见 docs/PROJECT.md §6.2） |
+| 套装扣减 | ⚠️ 已作废（v1.5.0 起改为求和比对 + modal 提示，不自动扣减） |
+| ❌ 未实现 | 无重大未实现项；待办见 docs/PROJECT.md §9（Excel 公式列缓存值待真实样本验证、v1.6.0 待 Chrome 冒烟） |
 | Git | Conventional Commits（husky+commitlint 强制），scope 建议 `excel`/`ui`/`import`/`config`/`pdf` |
 
 ## 强制约定
@@ -42,6 +42,6 @@
 
 ## 当前最高优先级待办
 
-- [ ] **与用户对齐 Excel 导入修改逻辑并重写该分支**（已整体移除：解析/匹配/预览/写回均待重写；旧实现可参考 git 历史 `58d1f97`，旧逻辑要点见 docs/PROJECT.md §6.1）
-- [ ] **实现 PDF 单件入口**（`applyPdfSingleToExcel`）— 规则已确认（2026-08-14，docs/PROJECT.md §6.2）；实现前先与用户对齐 §6.2 文末歧义点（Excel「单价」表头名、单件是否标缺货、解析器需扩展提取 Unit Price in HKD + 第2页汇总值）
-- [ ] `searchPoByName`/`searchPoByRef` 去重合并（Excel 流重写时一并处理）
+- [x] **Excel 导入入口**（v1.6.0 已实现）：上传 Excel → 比对 Odoo 现有值 → 可编辑 Modal 写回（详见 docs/PROJECT.md §6.3）
+- [ ] **Chrome 冒烟验证 v1.6.0**：双 Tab 切换、Excel 流上传/预览/比对悬浮/写回、PDF 流回归
+- [ ] `searchPoByName`/`searchPoByRef` 去重合并（低优先，保留无害）

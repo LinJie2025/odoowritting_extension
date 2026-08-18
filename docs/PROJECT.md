@@ -1,7 +1,7 @@
 # Odoo Excel Importer — 项目文档
 
 > 本文件是项目的**权威文档**，与代码同步维护。任何 Agent 接任务前必须先读本文件。
-> 最后更新：2026-08-18（manifest v1.5.0）
+> 最后更新：2026-08-18（manifest v1.6.0）
 
 ---
 
@@ -15,7 +15,7 @@
 | 技术栈 | 纯原生 JS（**ES5 风格：`var` + IIFE + function 声明**），无框架、无构建步骤 |
 | 第三方库 | `lib/xlsx.full.min.js`（SheetJS）、`lib/pdf.min.js` + `lib/pdf.worker.min.js`（pdfjs-dist **3.11.174 UMD 版**，4.x 起无 UMD 故锁定 3.x） |
 | 运行环境 | 任意 Odoo 实例的 `purchase.order` 页面（URL hash 含 `model=purchase.order`） |
-| 版本 | manifest v1.5.0 |
+| 版本 | manifest v1.6.0 |
 
 **核心价值**：人工核对采购数据 → 自动写回 Odoo 的「数量 / 包装数量 / 整箱批发价 / 备注」字段，避免逐行手工录入。
 
@@ -97,21 +97,21 @@ odoowritting_extension/
 
 ## 4. 架构分层（content.js 内部结构）
 
-单个 IIFE 内按 `═══` 注释分块，共 11 块：
+单个 IIFE 内按 `═══` 注释分块，共 12 块：
 
 | 块 | 内容 | 关键函数 |
 |---|---|---|
 | 常量 | 字段映射、列名、前缀 | — |
 | 工具 | DOM 创建 `el()`、HTML 转义 `escHtml()`、`sleep`、价格计算 | `calcBoxPrice`（×0.9，整数分运算防浮点误差）、`parsePieces`（从 "1 box of 20 pieces" 取 20） |
-| Odoo API | JSON-RPC 封装 | `rpcCall`、`searchPoByName`（Excel 流重写时备用）、`searchPoByRef`、`getOrderLines`、`updateOrderLine` |
-| Excel 解析 | ~~两种解析器~~ | ⚠️ `parseExcel` 已移除（2026-08-14）；`parseOrderExcel`（按表头列名）仅 PDF 流使用 |
+| Odoo API | JSON-RPC 封装 | `rpcCall`、`searchPoByRef`、`getOrderLines`（含 `product_packaging_qty`）、`updateOrderLine`；`searchPoByName` 已无用可删 |
+| Excel 解析 | 按表头列名解析 | `parseOrderExcel`（PDF/Excel 两流共用） |
 | PDF 解析 | 文本块坐标聚类成表 | `parsePdf`（pdfjs 入口）、`extractPdfTable`（核心算法） |
-| 业务逻辑 | 匹配修正规则 | `applyPdfByMode`（入口分发）、`applyPdfSet`（套装，v1.5 统一公式）、`applyPdfSingle`（单件） |
+| 业务逻辑 | 匹配修正规则 | `applyPdfByMode`（PDF 入口分发）、`applyPdfSet`（套装）、`applyPdfSingle`（单件）、**`applyExcelChanges`（Excel 流：Excel 值 vs Odoo 现有值比对）** |
 | 日志 | localStorage 存取 | `saveLog`/`getLog`/`clearLog`/`downloadLog` |
-| 状态 | 应用状态对象 | `appState`、`pdfState`、`dragCtx` |
-| UI | 按钮/卡片/Tab/上传区/日志区 | `createDraggableButton`、`renderCardContent`、`renderTabSwitch`、`renderPdfZone`、`renderPdfModePicker` |
-| 预览 Modal | PDF 流 1 套 | `buildPdfPreviewModal`（PDF 流）；⚠️ Excel 流预览 Modal/标签条已移除待重写 |
-| 执行写回 | PDF 流批量写入 | `executePdfUpdate`（PDF 流）；⚠️ Excel 流 `executeUpdate` 已移除待重写 |
+| 状态 | 应用状态对象 | `appState`（含 `activeTab`）、`pdfState`、`excelState`、`dragCtx` |
+| UI | 按钮/卡片/双 Tab/上传区/日志区 | `createDraggableButton`、`renderCardContent`、**`renderTabSwitch`（双 Tab）**、`renderExcelZone`、`renderPdfZone`、`renderModePicker`（两流共用） |
+| 预览 Modal | 双流共用 1 套 | `buildPdfPreviewModal(previewRows, fileName, source)`（source='pdf'/'excel'）、`loadOrderLineMap`、`buildPreviewRows` |
+| 执行写回 | 双流共用批量写入 | `executePdfUpdate`（两流共用，字段经 ODOO_FIELDS 映射） |
 | 初始化 | 注入条件与路由 | `inject()`、`isPurchaseOrderPage()`、`hashchange` 监听 |
 
 ---
@@ -126,7 +126,7 @@ odoowritting_extension/
 | `rpcCall(endpoint, params)` | 通用调用 | body: `{jsonrpc:"2.0", method:"call", params, id}` |
 | `searchPoByName(name)` | Excel 导入流查 PO | domain `[["name","=",name]]`，fields 需含 `order_line` |
 | `searchPoByRef(ref)` | PDF 流查 PO | domain 用 `ODOO_FIELDS.poRef`（=name），fields 需含 `name`（否则查询为空） |
-| `getOrderLines(ids)` | 批量取订单行 | fields: `id,name,price_unit,box_wholesale_price,remark`；**从 `line.name` 正则 `\[(\d+)\]` 提取 UPC 作为匹配键** |
+| `getOrderLines(ids)` | 批量取订单行 | fields: `id,name,price_unit,box_wholesale_price,remark,product_packaging_qty`；**从 `line.name` 正则 `\[(\d+)\]` 提取 UPC 作为匹配键** |
 | `updateOrderLine(lineId, payload)` | 写回单行 | `write` 方法 |
 
 > 注意：`searchPoByName` 与 `searchPoByRef` 逻辑几乎重复（都查 name），系历史遗留，重构时可合并。
@@ -242,20 +242,51 @@ odoowritting_extension/
 - 只处理勾选行；预览行标红场景：数量不一致（qtyMismatch）、缺货（outstock）、匹配失败（error）
 - 每条变更字段带 `odooField`，为 null 的字段（箱规价/0.9总价）仅比对不写回
 
+### 6.3 Excel 导入流（manifest v1.6.0 新增，2026-08-18）
+
+> **用户需求**：新增「📊 Excel 导入」入口，与 PDF 修正并列（恢复双 Tab）。上传 Excel 后**不做 PDF 比对**，直接把每条 Excel 行的现有值作为写回目标，与 **Odoo 订单行现有值**比对，Modal 展示不一致字段（可编辑 + 悬浮显示原因），确认后写回。
+
+```
+步骤0 选入口（单件📦 / 套装🎁）——与 PDF 区共用 renderModePicker
+步骤1 上传 Excel → parseOrderExcel（复用）
+步骤2 预览 buildPdfPreviewModal(source='excel')：Excel 值 vs Odoo 现有值比对
+      → executePdfUpdate 写回
+```
+
+**写回字段（用户确认）**：
+
+| 入口 | 写回字段（Odoo） |
+|---|---|
+| 单件 | abw交货箱数 `product_packaging_qty` + 单价 `price_unit` + 备注 `remark` |
+| 套装 | 上述 + 0.9箱规价 `box_wholesale_price` |
+
+**比对规则（`applyExcelChanges`）**：
+- 匹配：Excel「订单关联」查 PO → `order_line` → UPC（行 name `[数字]`）命中订单行；未命中 → 预览行标红「未找到匹配的订单行」不可勾选
+- 目标值 = Excel 列原值（abw交货箱数/单价/0.9箱规价），比对 Odoo 现有值，不一致 → 字段标红 + hover 悬浮「Excel X ≠ Odoo Y」（REASONS.excel* 文案）
+- 备注：**仅 Excel 有值时写回**（避免空值清空 Odoo 备注）；与 Odoo 不一致才标红
+- Modal 表格布局：无「数量核对」「PDF Qty」列（PDF 流专属）；标题前缀 📊；`fieldOrder(mode,'excel')` = 单件 `[boxQty,unitPrice,remark]` / 套装 `[boxQty,unitPrice,boxPrice09,remark]`
+- 与 Odoo 全部一致的 Excel 行 → 无变更不可勾选（不产生写回）
+
+**双流共用重构（v1.6.0）**：
+- `loadOrderLineMap(orderRefs)`：查 PO + 取订单行构建 lineMap（Excel 流先查后构 changes，PDF 流保持原入口）
+- `buildPreviewRows(changes, lineMap)`：changes + lineMap → 预览行（两流共用）
+- `buildPdfPreviewModal/Table/Row/TotalRow` 增加 `source` 参数（'pdf'/'excel'）
+- `renderModePicker(onSelect)` 参数化（两流共用单件/套装选择）
+- `getOrderLines` 增读 `product_packaging_qty`
+
 ---
 
 ## 7. UI 结构
 
 | 组件 | 说明 |
 |---|---|
-| 可拖动按钮 📥 | 右下角 52px 圆形紫色按钮，位置存 localStorage；拖文件到按钮上可直接导入 |
-| 悬浮卡片 | 点按钮展开（340×500px），含 Header、双 Tab、上传区、预览窗口标签条、日志区 |
-| 双 Tab | 「📊 Excel 导入」/「📄 PDF 修正」（`appState.activeTab`） |
-| 入口选择器 | PDF 区步骤 0：单件📦 / 套装🎁 两张卡片，选中后锁入口，可「切换入口」重置 |
-| 步骤指示器 | 选中入口后显示：① 上传 PDF → ② 上传 Excel → ③ 预览确认（当前步紫色、已完成绿色） |
-| 常驻错误框 | `pdfState.error`：PDF/Excel 解析失败时在卡片内红色常驻显示原因（如「未识别到表头——请确认 PDF 为文本型而非扫描件」），下次成功自动清除 |
-| 预览 Modal | 92vw 宽居中弹窗，Excel 流可最小化（点遮罩最小化、标签条恢复）；PDF 流仅关闭 |
-| 标签条 | 每个 Excel 文件一个 tab（`appState.tabs`），最小化的 Modal 可从标签恢复 |
+| 可拖动按钮 📥 | 右下角 52px 圆形紫色按钮，位置存 localStorage；拖文件到按钮上提示在卡片内选择入口 |
+| 悬浮卡片 | 点按钮展开（340×500px），含 Header、双 Tab、上传区、日志区 |
+| 双 Tab | 「📊 Excel 导入」/「📄 PDF 修正」（`appState.activeTab`，v1.6.0 恢复） |
+| 入口选择器 | 步骤 0：单件📦 / 套装🎁 两张卡片（PDF/Excel 两流共用 `renderModePicker`），选中后锁入口，可「切换入口」重置 |
+| 步骤指示器 | PDF 区：① 上传 PDF → ② 上传 Excel → ③ 预览确认（当前步紫色、已完成绿色） |
+| 常驻错误框 | `pdfState.error` / `excelState.error`：解析失败时在卡片内红色常驻显示原因，下次成功自动清除 |
+| 预览 Modal | 92vw 宽居中弹窗，双流共用（`source` 区分布局）；PDF 流含数量核对/PDF Qty 列，Excel 流不含 |
 | 日志区 | 最近一次执行结果（成功/失败/跳过计数），可下载 JSON、清除 |
 | Toast / Loading | 右下角提示；顶部紫色 loading 胶囊（`updateLoadingOverlay`） |
 
@@ -297,24 +328,24 @@ odoowritting_extension/
 
 | # | 问题 | 位置 | 状态 |
 |---|---|---|---|
-| 1 | ~~Excel 导入分支处理逻辑~~ | — | ✅ 已彻底移除该 Tab（v1.4.0），只留 PDF 修正 |
+| 1 | ~~Excel 导入分支处理逻辑~~ | — | ✅ v1.6.0 重写上线：Excel 入口（单件/套装 + 比对 Odoo + 可编辑 Modal），恢复双 Tab |
 | 2 | ~~单件入口逻辑未实现~~ | `applyPdfSingle` | ✅ 已实现（v1.4.0，UPC/Catalog 匹配 + 单价×factor + 数量求和提示） |
 | 3 | ~~Excel 的 Catalog 列名待确认~~ | `EXCEL_COLS.catalog` | ✅ 已确认 = 「SKU_x」（2026-08-17 实测） |
 | 4 | Excel 公式列（0.9箱规价/0.9总价/单价）缓存值能否被 SheetJS 读到 | `parseOrderExcel` | ⚠️ 需真实 Excel 样本验证 |
-| 5 | `searchPoByName` 已无用（Excel 流移除后无调用方） | Odoo API 层 | ℹ️ 可删除，保留无害 |
+| 5 | `searchPoByName` 已无用（无调用方） | Odoo API 层 | ℹ️ 可删除，保留无害 |
 | 6 | `ODOO_FIELDS.qty`（product_qty）已不写回 | content.js | ℹ️ 保留备用 |
-| 7 | ~~子目录打包副本版本落后~~ | `odoowritting_extension/` | ✅ 已同步（v1.5.0） |
+| 7 | ~~子目录打包副本版本落后~~ | `odoowritting_extension/` | ✅ 已同步（v1.6.0） |
 | 8 | ~~Odoo 字段名待实测~~ | `ODOO_FIELDS` | ✅ 已确认：`product_packaging_qty` / `box_wholesale_price` / `price_unit` / `remark` |
 | 9 | ~~套装分格式公式/随机扣减~~ | `applyPdfSet` | ✅ v1.5.0 重写：统一公式 + 4 项比对 + 套装单件数量（PRODUCT DESCRIPTION "x30"） |
 | 10 | modal 增强（订单关联统计/PDF 对照/hover 原因/列总和） | `buildPdfPreviewModal` 等 | ⚠️ 已实现 v1.5.0，待 Chrome 冒烟验证 |
+| 11 | Excel 流比对 Odoo + 可编辑 Modal + 双 Tab | `applyExcelChanges` 等 | ⚠️ v1.6.0 已实现，逻辑单测通过，待 Chrome 冒烟验证 |
 
 ---
 
 ## 10. 快速上手（新 Agent 3 分钟版）
 
-1. **只改一个文件**：`content.js`（~1436 行，IIFE 单文件）；字段映射在顶部两个常量对象
-2. **当前只有 PDF 修正流在线**：`parseOrderExcel`（按列名）+`searchPoByRef`+`executePdfUpdate`；**Excel 导入 Tab 是占位**（逻辑已移除待重写，见 §9 #1）
-3. **UPC 是核心匹配键**：Excel 列「订单行/产品/内部参考号」↔ Odoo 行 name 中 `[数字]` ↔ PDF 表 UPC 列
+1. **只改一个文件**：`content.js`（IIFE 单文件）；字段映射在顶部两个常量对象
+2. **两条在线流程（v1.6.0）**：📊 Excel 导入（上传 Excel → 比对 Odoo 现有值 → 可编辑 Modal 写回）+ 📄 PDF 修正（上传 PDF → 上传 Excel → 匹配修正 → Modal 写回）；共用 `parseOrderExcel` / `loadOrderLineMap` / `buildPreviewRows` / Modal / `executePdfUpdate`
+3. **UPC 是核心匹配键**：Excel 列「订单行/产品/内部参考号」↔ Odoo 行 name 中 `[数字]` ↔ PDF 表 UPC 列；「订单关联」列查 PO（=name）
 4. **无构建、无测试**：改完同步到 `odoowritting_extension/` 子目录后到 Chrome 手动验证
-5. **未实现的功能**：单件入口（§9 #2）＋ Excel 导入流（§9 #1），接相关任务先找用户确认规则
-6. Git 提交必须过 commitlint（husky），格式 `type(scope): subject`
+5. Git 提交必须过 commitlint（husky），格式 `type(scope): subject`
