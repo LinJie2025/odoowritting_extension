@@ -283,15 +283,22 @@
       throw new Error("表头已识别，但未找到 UPC 数据行（UPC 需为 8~14 位纯数字）")
     }
 
-    // 8. 每行归属
+    // 8. 行聚类（B：行高自适应，2026-08-18）
+    //    行高 = 相邻锚点 y 间距（跨页/异常间距 >120 时沿用上一行高）；
+    //    归属范围 = [a.y - max(8, h*0.4), a.y + h*0.8] —— 下行覆盖 desc 折行，上行防串入上一行 desc 第二行
     var numishRe = /^[\d\s.,+-]+$/
-    var rows = []
+    var heights = []
+    for (var ha = 0; ha < anchors.length; ha++) {
+      var hh = ha + 1 < anchors.length ? anchors[ha + 1].y - anchors[ha].y : -1
+      if (hh < 8 || hh > 120) hh = heights.length ? heights[heights.length - 1] : 30
+      heights.push(hh)
+    }
+    var dataRows = []   // 通过假行过滤的 { cells }（粗分：标题中点边界）
     for (var ai = 0; ai < anchors.length; ai++) {
       var a = anchors[ai]
-      // 非对称行归属（2026-08-18 修复）：行高仅 20pt 时 desc 第二行比 UPC 锚点低 9~13pt，
-      // 而上一行 desc 第二行只比本行锚点高 11.3pt —— 旧对称容差 ±12 会把上行 desc 第二行串入本行
+      var h = heights[ai]
       var rowItems = items.filter(function (i) {
-        return i.y > headerY && i.y >= a.y - 8 && i.y <= a.y + 18
+        return i.y > headerY && i.y >= a.y - Math.max(8, h * 0.4) && i.y <= a.y + h * 0.8
       })
       var cells = {}
       for (var ri = 0; ri < rowItems.length; ri++) {
@@ -305,32 +312,100 @@
         cells[ci2].sort(function (x, y) { return x.y - y.y })
         row[ci2] = cells[ci2].map(function (x) { return x.text }).join(" ")
       }
-      // 假行过滤（2026-08-18 修复）：页脚/客户信息文本落入 UPC 列（如 'Phone: 18922477200'）
-      // 时行内无任何数据列字段，跳过
+      // 假行过滤：页脚/客户信息文本落入 UPC 列（如 'Phone: 18922477200'）时行内无数据列字段，跳过
       if (!(row[catCol] || row[qtyCol] || row[priceCol] || row[subCol])) continue
-      // desc 兜底（2026-08-18 修复）：PRODUCT DESCRIPTION 列标题与内容左边界错位时
-      // （标题居中/右对齐），desc 文本块会落在相邻列区间（HS CODE 列）。
-      // 从 descCol 相邻列逐块取「含字母」文本块合并为 desc，排除纯数字块（HS CODE 值）。
-      // 注意：必须在行循环内计算并挂到 row 上，map 回调中引用 cells 会拿到最后一行的值（闭包陷阱）
-      var descText = (row[descCol] || "").trim()
+      dataRows.push({ cells: cells })
+    }
+
+    // 9. 列边界校准（A：内容聚类，2026-08-18）
+    //    表头位置随对齐方式漂移（居中/右对齐），内容位置才是真实列边界。
+    //    列边界 = 相邻两列「内容范围」的间隙中点；空列/内容重叠时用标题中点兜底。
+    var colBlocks = []
+    for (var cb = 0; cb < headerRow.length; cb++) colBlocks.push([])
+    for (var dr = 0; dr < dataRows.length; dr++) {
+      var drc = dataRows[dr].cells
+      for (var dc in drc) {
+        var dcNum = parseInt(dc, 10)
+        for (var dbi = 0; dbi < drc[dc].length; dbi++) colBlocks[dcNum].push(drc[dc][dbi])
+      }
+    }
+    // desc 列粗分为空（标题与内容错位时 desc 被粗分进相邻列）→ 从相邻列摘除「含字母」块补入 desc 列
+    if (descCol >= 0 && colBlocks[descCol].length === 0) {
+      for (var si = -1; si <= 1; si += 2) {
+        var sCol = descCol + si
+        if (sCol < 0 || sCol >= colBlocks.length) continue
+        var kept = []
+        for (var sb = 0; sb < colBlocks[sCol].length; sb++) {
+          var sblk = colBlocks[sCol][sb]
+          if (/[A-Za-z]/.test(sblk.text) && !numishRe.test(sblk.text)) colBlocks[descCol].push(sblk)
+          else kept.push(sblk)
+        }
+        colBlocks[sCol] = kept
+      }
+    }
+    var colRange = []
+    for (var cr = 0; cr < colBlocks.length; cr++) {
+      var minX0 = Infinity, maxX1 = -Infinity
+      for (var cbi = 0; cbi < colBlocks[cr].length; cbi++) {
+        var blk = colBlocks[cr][cbi]
+        if (blk.x0 < minX0) minX0 = blk.x0
+        if (blk.x1 > maxX1) maxX1 = blk.x1
+      }
+      colRange.push({ minX0: minX0, maxX1: maxX1, empty: colBlocks[cr].length === 0 })
+    }
+    var newBounds = []
+    for (var nb = 0; nb < bounds.length; nb++) {
+      var lo = colRange[nb].empty ? bounds[nb] : colRange[nb].maxX1
+      var hi = colRange[nb + 1].empty ? bounds[nb] : colRange[nb + 1].minX0
+      newBounds.push(lo < hi ? (lo + hi) / 2 : bounds[nb])
+    }
+    function colIndex2(x0) {
+      for (var i = 0; i < headerRow.length; i++) {
+        var lo = i > 0 ? newBounds[i - 1] : -Infinity
+        var hi = i < newBounds.length ? newBounds[i] : Infinity
+        if (x0 >= lo && x0 < hi) return i
+      }
+      return headerRow.length - 1
+    }
+
+    // 10. 按新列边界重新归属
+    var rows = []
+    for (var rr = 0; rr < dataRows.length; rr++) {
+      var src = dataRows[rr].cells
+      var cells2 = {}
+      for (var sc in src) {
+        for (var sbi = 0; sbi < src[sc].length; sbi++) {
+          var blk2 = src[sc][sbi]
+          var ci2b = colIndex2(blk2.x0)
+          if (!cells2[ci2b]) cells2[ci2b] = []
+          cells2[ci2b].push(blk2)
+        }
+      }
+      var row2 = {}
+      for (var ci4 in cells2) {
+        cells2[ci4].sort(function (x, y) { return x.y - y.y })
+        row2[ci4] = cells2[ci4].map(function (x) { return x.text }).join(" ")
+      }
+      // desc 兜底（保险）：重新归属后 desc 列仍空时，从相邻列逐块取含字母文本合并
+      var descText = (row2[descCol] || "").trim()
       if (!descText && descCol >= 0) {
         var parts = []
-        for (var ci3 in row) {
-          var cnum = parseInt(ci3, 10)
+        for (var ci5 in row2) {
+          var cnum = parseInt(ci5, 10)
           if (cnum === descCol || Math.abs(cnum - descCol) > 1) continue
-          var blocks = cells[ci3] || []
-          for (var bi = 0; bi < blocks.length; bi++) {
-            var bt = blocks[bi].text
+          var blocks = cells2[ci5] || []
+          for (var bi2 = 0; bi2 < blocks.length; bi2++) {
+            var bt = blocks[bi2].text
             if (/[A-Za-z]/.test(bt) && !numishRe.test(bt)) parts.push(bt)
           }
         }
         descText = parts.join(" ")
       }
-      row.__desc = descText
-      rows.push(row)
+      row2.__desc = descText
+      rows.push(row2)
     }
 
-    // 9. 输出：格式 + Coupon + 关键列
+    // 11. 输出：格式 + Coupon + 关键列
     return {
       format: hasHsCode ? "B" : "A",
       coupon: extractCoupon(items),
@@ -381,8 +456,10 @@
           var str = (it.str || "").trim()
           if (!str) continue
           var vp = viewport.convertToViewportPoint(it.transform[4], it.transform[5])
+          // x1 = 文本右边缘（内容聚类列边界用；pdfjs width 为文本空间宽度，加 transform[4] 即右边缘 x）
+          var vp1 = viewport.convertToViewportPoint(it.transform[4] + (it.width || 0), it.transform[5])
           // 页偏移：多页时各页 y 从 0 起，加 (page-1)*1000 使全局 y 单调递增，避免跨页坐标重叠
-          items.push({ text: str, x0: vp[0], y: vp[1] + (p - 1) * 1000, page: p })
+          items.push({ text: str, x0: vp[0], x1: vp1[0], y: vp[1] + (p - 1) * 1000, page: p })
         }
       }
     } finally {
@@ -542,11 +619,13 @@
       var pair = m.pairs[i]
       var ex = pair.excel, p = pair.pdf
       var fields = []
+      // PDF 原始字段（悬浮提示第一行，2026-08-18 用户需求）
+      var pdfRaw = ["UPC=" + p.upc, "QTY=" + p.qty, "UNIT PRICE=" + p.unitPrice, "Subtotal=" + p.subtotal].join(" | ")
       // abw交货箱数（数量核对：可编辑，默认原值；数量不一致由 qtyMismatch 提示）
-      fields.push({ key: "boxQty", label: "abw交货箱数", odooField: ODOO_FIELDS.boxQty, oldValue: ex.boxQty, newValue: ex.boxQty, changed: false })
+      fields.push({ key: "boxQty", label: "abw交货箱数", odooField: ODOO_FIELDS.boxQty, oldValue: ex.boxQty, newValue: ex.boxQty, changed: false, pdfRaw: pdfRaw })
       // abw交货箱数为空或 0 → 备注缺货
       if (ex.boxQty == null || ex.boxQty === 0) {
-        fields.push({ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: ex.remark || "", newValue: "缺货", changed: true, reason: REASONS.boxQtyEmpty })
+        fields.push({ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: ex.remark || "", newValue: "缺货", changed: true, reason: REASONS.boxQtyEmpty, pdfRaw: pdfRaw })
       }
       // 单价：PDF UNIT PRICE × factor vs Excel 单价列
       var unit = parseFloatNum(p.unitPrice)
@@ -557,7 +636,8 @@
         key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice,
         oldValue: ex.unitPrice, newValue: newUnit, changed: changed,
         pdfSource: newUnit !== null ? "PDF: " + expr + " = " + newUnit : "",
-        reason: changed ? REASONS.unitPrice(newUnit, expr, ex.unitPrice) : null
+        reason: changed ? REASONS.unitPrice(newUnit, expr, ex.unitPrice) : null,
+        pdfRaw: pdfRaw
       })
       changes.push({
         kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef,
@@ -588,16 +668,20 @@
       var pair = m.pairs[i]
       var ex = pair.excel, p = pair.pdf
       var fields = []
-      // abw交货箱数（数量核对：可编辑，默认原值；数量不一致由 qtyMismatch 提示）
-      fields.push({ key: "boxQty", label: "abw交货箱数", odooField: ODOO_FIELDS.boxQty, oldValue: ex.boxQty, newValue: ex.boxQty, changed: false })
-      // abw交货箱数为空或 0 → 备注缺货
-      if (ex.boxQty == null || ex.boxQty === 0) {
-        fields.push({ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: ex.remark || "", newValue: "缺货", changed: true, reason: REASONS.boxQtyEmpty })
-      }
       // 套装单件数量：PDF PRODUCT DESCRIPTION "x30" → 降级 Excel 包装列 pieces
       var pieces = parseSetPieces(p.description, ex.pack)
       var unit = parseFloatNum(p.unitPrice)
       var sub = parseFloatNum(p.subtotal)
+      // PDF 原始字段（悬浮提示第一行，2026-08-18 用户需求）
+      var pdfRaw = ["UPC=" + p.upc, "QTY=" + p.qty, "UNIT PRICE=" + p.unitPrice, "Subtotal=" + p.subtotal].join(" | ")
+      if (pieces && pieces > 0) pdfRaw += " | 套装单件数量=" + pieces
+
+      // abw交货箱数（数量核对：可编辑，默认原值；数量不一致由 qtyMismatch 提示）
+      fields.push({ key: "boxQty", label: "abw交货箱数", odooField: ODOO_FIELDS.boxQty, oldValue: ex.boxQty, newValue: ex.boxQty, changed: false, pdfRaw: pdfRaw })
+      // abw交货箱数为空或 0 → 备注缺货
+      if (ex.boxQty == null || ex.boxQty === 0) {
+        fields.push({ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: ex.remark || "", newValue: "缺货", changed: true, reason: REASONS.boxQtyEmpty, pdfRaw: pdfRaw })
+      }
 
       // 箱规价 = UNIT PRICE 原值（不写回）
       var newBoxPrice = unit
@@ -606,7 +690,8 @@
         key: "boxPrice", label: "箱规价", odooField: null,
         oldValue: ex.boxPrice, newValue: newBoxPrice, changed: boxPriceChanged,
         pdfSource: newBoxPrice !== null ? "PDF: UNIT PRICE " + newBoxPrice : "",
-        reason: boxPriceChanged ? REASONS.boxPrice(newBoxPrice, ex.boxPrice) : null
+        reason: boxPriceChanged ? REASONS.boxPrice(newBoxPrice, ex.boxPrice) : null,
+        pdfRaw: pdfRaw
       })
 
       // 单价 = UNIT PRICE × factor ÷ 套装单件数量 → price_unit
@@ -622,7 +707,8 @@
         key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice,
         oldValue: ex.unitPrice, newValue: newUnit, changed: unitChanged,
         pdfSource: newUnit !== null ? "PDF: " + unitExpr + " = " + newUnit : "",
-        reason: unitChanged ? REASONS.unitPrice(newUnit, unitExpr, ex.unitPrice) : null
+        reason: unitChanged ? REASONS.unitPrice(newUnit, unitExpr, ex.unitPrice) : null,
+        pdfRaw: pdfRaw
       })
 
       // 0.9箱规价 = UNIT PRICE × factor → box_wholesale_price
@@ -632,7 +718,8 @@
         key: "boxPrice09", label: "0.9箱规价", odooField: ODOO_FIELDS.boxWholesalePrice,
         oldValue: ex.boxPrice09, newValue: newBoxPrice09, changed: box09Changed,
         pdfSource: newBoxPrice09 !== null ? "PDF: " + factorExpr(unit, factor) + " = " + newBoxPrice09 : "",
-        reason: box09Changed ? REASONS.boxPrice09(newBoxPrice09, factorExpr(unit, factor), ex.boxPrice09) : null
+        reason: box09Changed ? REASONS.boxPrice09(newBoxPrice09, factorExpr(unit, factor), ex.boxPrice09) : null,
+        pdfRaw: pdfRaw
       })
 
       // 0.9总价 = Subtotal × factor（不写回，仅比对）
@@ -642,7 +729,8 @@
         key: "total09", label: "0.9总价", odooField: null,
         oldValue: ex.total09, newValue: newTotal09, changed: total09Changed,
         pdfSource: newTotal09 !== null ? "PDF: " + factorExpr(sub, factor) + " = " + newTotal09 : "",
-        reason: total09Changed ? REASONS.total09(newTotal09, factorExpr(sub, factor), ex.total09) : null
+        reason: total09Changed ? REASONS.total09(newTotal09, factorExpr(sub, factor), ex.total09) : null,
+        pdfRaw: pdfRaw
       })
 
       changes.push({
@@ -1608,8 +1696,11 @@
       qtyTd.addEventListener("mouseenter", function () {
         if (qTip) return
         qTip = el("div", {
-          style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:6px 10px;border-radius:6px;max-width:340px;line-height:1.5;pointer-events:none"
-        }, REASONS.qtySum(row.qtySum, row.qtyTarget))
+          style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:8px 10px;border-radius:6px;max-width:340px;line-height:1.5;pointer-events:none"
+        })
+        // 两行悬浮：第一行 PDF 原始 Qty，第二行对比结果（2026-08-18 用户需求）
+        qTip.innerHTML = '<div style="font-weight:600;margin-bottom:4px;color:#e5e7eb">PDF Qty = ' + escHtml(fmtNum(row.qtyTarget)) + '</div>' +
+          '<div>' + escHtml(REASONS.qtySum(row.qtySum, row.qtyTarget)) + '</div>'
         document.body.appendChild(qTip)
         var r = qtyTd.getBoundingClientRect()
         qTip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - qTip.offsetWidth - 8)) + "px"
@@ -1663,8 +1754,13 @@
             inp.addEventListener("mouseenter", function () {
               if (tip || !fld.reason) return
               tip = el("div", {
-                style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:6px 10px;border-radius:6px;max-width:340px;line-height:1.5;pointer-events:none"
-              }, fld.reason)
+                style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:8px 10px;border-radius:6px;max-width:440px;line-height:1.5;pointer-events:none"
+              })
+              // 两行悬浮：第一行 PDF 原始字段与数据，第二行计算过程（2026-08-18 用户需求）
+              tip.innerHTML = fld.pdfRaw
+                ? '<div style="font-weight:600;margin-bottom:4px;color:#e5e7eb;white-space:pre-wrap">' + escHtml(fld.pdfRaw) + '</div>' +
+                  '<div style="white-space:pre-wrap">' + escHtml(fld.reason) + '</div>'
+                : escHtml(fld.reason)
               document.body.appendChild(tip)
               var r = inp.getBoundingClientRect()
               tip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - tip.offsetWidth - 8)) + "px"
