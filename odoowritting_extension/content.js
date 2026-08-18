@@ -284,10 +284,15 @@
     }
 
     // 8. 每行归属
+    var numishRe = /^[\d\s.,+-]+$/
     var rows = []
     for (var ai = 0; ai < anchors.length; ai++) {
       var a = anchors[ai]
-      var rowItems = items.filter(function (i) { return i.y > headerY && Math.abs(i.y - a.y) <= 12 })
+      // 非对称行归属（2026-08-18 修复）：行高仅 20pt 时 desc 第二行比 UPC 锚点低 9~13pt，
+      // 而上一行 desc 第二行只比本行锚点高 11.3pt —— 旧对称容差 ±12 会把上行 desc 第二行串入本行
+      var rowItems = items.filter(function (i) {
+        return i.y > headerY && i.y >= a.y - 8 && i.y <= a.y + 18
+      })
       var cells = {}
       for (var ri = 0; ri < rowItems.length; ri++) {
         var it = rowItems[ri]
@@ -300,6 +305,28 @@
         cells[ci2].sort(function (x, y) { return x.y - y.y })
         row[ci2] = cells[ci2].map(function (x) { return x.text }).join(" ")
       }
+      // 假行过滤（2026-08-18 修复）：页脚/客户信息文本落入 UPC 列（如 'Phone: 18922477200'）
+      // 时行内无任何数据列字段，跳过
+      if (!(row[catCol] || row[qtyCol] || row[priceCol] || row[subCol])) continue
+      // desc 兜底（2026-08-18 修复）：PRODUCT DESCRIPTION 列标题与内容左边界错位时
+      // （标题居中/右对齐），desc 文本块会落在相邻列区间（HS CODE 列）。
+      // 从 descCol 相邻列逐块取「含字母」文本块合并为 desc，排除纯数字块（HS CODE 值）。
+      // 注意：必须在行循环内计算并挂到 row 上，map 回调中引用 cells 会拿到最后一行的值（闭包陷阱）
+      var descText = (row[descCol] || "").trim()
+      if (!descText && descCol >= 0) {
+        var parts = []
+        for (var ci3 in row) {
+          var cnum = parseInt(ci3, 10)
+          if (cnum === descCol || Math.abs(cnum - descCol) > 1) continue
+          var blocks = cells[ci3] || []
+          for (var bi = 0; bi < blocks.length; bi++) {
+            var bt = blocks[bi].text
+            if (/[A-Za-z]/.test(bt) && !numishRe.test(bt)) parts.push(bt)
+          }
+        }
+        descText = parts.join(" ")
+      }
+      row.__desc = descText
       rows.push(row)
     }
 
@@ -314,7 +341,7 @@
           qty: (r[qtyCol] || "").trim(),
           unitPrice: (r[priceCol] || "").trim(),
           subtotal: (r[subCol] || "").trim(),
-          description: (r[descCol] || "").trim()
+          description: r.__desc || ""
         }
       })
     }
@@ -404,7 +431,8 @@
       orderRef: colIdx(EXCEL_COLS.orderRef)
     }
     if (idx.upc < 0) idx.upc = colIdxFuzzy(["内部参考号", "UPC", "EAN"])
-    if (idx.catalog < 0) idx.catalog = colIdxFuzzy(["SKU", "Catalog", "货号"])
+    // 「包装/SKU」优先于「Box SKU」——两者都含 "SKU"，若按含 SKU 兜底会先命中 Box SKU 列（2026-08-18 修复）
+    if (idx.catalog < 0) idx.catalog = colIdxFuzzy(["包装/SKU", "SKU_x", "SKU", "Catalog", "货号"])
     if (idx.upc < 0) throw new Error("未找到 UPC 列（「" + EXCEL_COLS.upc + "」）")
 
     var result = []
