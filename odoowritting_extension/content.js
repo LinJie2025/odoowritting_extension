@@ -718,7 +718,8 @@
 
   // ── 单件入口：数量核对（提示）+ 单价（UNIT PRICE ×0.9 vs 单价列）──
   // v1.5：公式不变，字段补充 reason / pdfSource 供 modal 对照与悬浮展示
-  function applyPdfSingle(pdfRows, excelRows, factor) {
+  // v1.8：Excel 入口（source='excel'）缺货行不写回单价（2026-08-19 用户需求）
+  function applyPdfSingle(pdfRows, excelRows, factor, source) {
     var m = matchPdfToExcel(pdfRows, excelRows)
     markQtyMismatch(m.pairs)
     var changes = []
@@ -726,12 +727,13 @@
       var pair = m.pairs[i]
       var ex = pair.excel, p = pair.pdf
       var fields = []
+      var outstock = (ex.boxQty == null || ex.boxQty === 0)   // 缺货行：Excel 入口不写回价格
       // PDF 原始字段（悬浮提示第一行，2026-08-18 用户需求）
       var pdfRaw = ["UPC=" + p.upc, "QTY=" + p.qty, "UNIT PRICE=" + p.unitPrice, "Subtotal=" + p.subtotal].join(" | ")
       // abw交货箱数（数量核对：可编辑，默认原值；数量不一致由 qtyMismatch 提示）
       fields.push({ key: "boxQty", label: "abw交货箱数", odooField: ODOO_FIELDS.boxQty, oldValue: ex.boxQty, newValue: ex.boxQty, changed: false, pdfRaw: pdfRaw })
       // abw交货箱数为空或 0 → 备注缺货
-      if (ex.boxQty == null || ex.boxQty === 0) {
+      if (outstock) {
         fields.push({ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: ex.remark || "", newValue: "缺货", changed: true, reason: REASONS.boxQtyEmpty, pdfRaw: pdfRaw })
       }
       // 单价：PDF UNIT PRICE × factor vs Excel 单价列
@@ -739,13 +741,16 @@
       var newUnit = applyFactor(unit, factor)
       var expr = unit !== null ? factorExpr(unit, factor) : null
       var changed = newUnit !== null && !numEq(ex.unitPrice, newUnit)
-      fields.push({
+      var unitField = {
         key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice,
         oldValue: ex.unitPrice, newValue: newUnit, changed: changed,
         pdfSource: newUnit !== null ? "PDF: " + expr + " = " + newUnit : "",
         reason: changed ? REASONS.unitPrice(newUnit, expr, ex.unitPrice) : null,
         pdfRaw: pdfRaw
-      })
+      }
+      // Excel 入口缺货行：单价仅比对展示，不写回 Odoo
+      if (outstock && source === "excel") unitField.odooField = null
+      fields.push(unitField)
       changes.push({
         kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef, partnerRef: ex.partnerRef,
         qtyTarget: pair.qtyTarget, qtySum: pair.qtySum, qtyMismatch: pair.qtyMismatch, qtyDetail: pair.qtyDetail,
@@ -767,7 +772,8 @@
   // ── 套装入口：统一公式（不区分 HS CODE）+ 4 项比对（2026-08-18 v1.5）──
   // 箱规价=UNIT PRICE 原值；单价=UNIT PRICE×factor÷套装单件数量；0.9箱规价=UNIT PRICE×factor；0.9总价=Subtotal×factor
   // 套装单件数量：PDF PRODUCT DESCRIPTION 的 "x30" → 降级 Excel 包装列 pieces
-  function applyPdfSet(pdfRows, excelRows, factor) {
+  // v1.8：Excel 入口（source='excel'）缺货行不写回单价/0.9箱规价（2026-08-19 用户需求）
+  function applyPdfSet(pdfRows, excelRows, factor, source) {
     var m = matchPdfToExcel(pdfRows, excelRows)
     markQtyMismatch(m.pairs)
     var changes = []
@@ -775,6 +781,7 @@
       var pair = m.pairs[i]
       var ex = pair.excel, p = pair.pdf
       var fields = []
+      var outstock = (ex.boxQty == null || ex.boxQty === 0)   // 缺货行：Excel 入口不写回价格
       // 套装单件数量：PDF PRODUCT DESCRIPTION "x30" → 降级 Excel 包装列 pieces
       var pieces = parseSetPieces(p.description, ex.pack)
       var unit = parseFloatNum(p.unitPrice)
@@ -786,7 +793,7 @@
       // abw交货箱数（数量核对：可编辑，默认原值；数量不一致由 qtyMismatch 提示）
       fields.push({ key: "boxQty", label: "abw交货箱数", odooField: ODOO_FIELDS.boxQty, oldValue: ex.boxQty, newValue: ex.boxQty, changed: false, pdfRaw: pdfRaw })
       // abw交货箱数为空或 0 → 备注缺货
-      if (ex.boxQty == null || ex.boxQty === 0) {
+      if (outstock) {
         fields.push({ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: ex.remark || "", newValue: "缺货", changed: true, reason: REASONS.boxQtyEmpty, pdfRaw: pdfRaw })
       }
 
@@ -810,24 +817,30 @@
         else newUnit = null
       }
       var unitChanged = newUnit !== null && !numEq(ex.unitPrice, newUnit)
-      fields.push({
+      var unitField = {
         key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice,
         oldValue: ex.unitPrice, newValue: newUnit, changed: unitChanged,
         pdfSource: newUnit !== null ? "PDF: " + unitExpr + " = " + newUnit : "",
         reason: unitChanged ? REASONS.unitPrice(newUnit, unitExpr, ex.unitPrice) : null,
         pdfRaw: pdfRaw
-      })
+      }
+      // Excel 入口缺货行：单价仅比对展示，不写回 Odoo
+      if (outstock && source === "excel") unitField.odooField = null
+      fields.push(unitField)
 
       // 0.9箱规价 = UNIT PRICE × factor → box_wholesale_price
       var newBoxPrice09 = applyFactor(unit, factor)
       var box09Changed = newBoxPrice09 !== null && !numEq(ex.boxPrice09, newBoxPrice09)
-      fields.push({
+      var box09Field = {
         key: "boxPrice09", label: "0.9箱规价", odooField: ODOO_FIELDS.boxWholesalePrice,
         oldValue: ex.boxPrice09, newValue: newBoxPrice09, changed: box09Changed,
         pdfSource: newBoxPrice09 !== null ? "PDF: " + factorExpr(unit, factor) + " = " + newBoxPrice09 : "",
         reason: box09Changed ? REASONS.boxPrice09(newBoxPrice09, factorExpr(unit, factor), ex.boxPrice09) : null,
         pdfRaw: pdfRaw
-      })
+      }
+      // Excel 入口缺货行：0.9箱规价仅比对展示，不写回 Odoo
+      if (outstock && source === "excel") box09Field.odooField = null
+      fields.push(box09Field)
 
       // 0.9总价 = Subtotal × factor（不写回，仅比对）
       var newTotal09 = applyFactor(sub, factor)
@@ -859,9 +872,10 @@
   }
 
   // ── 入口分发：按 PDF 修正入口路由到对应处理逻辑 ──
-  function applyPdfByMode(pdfRows, excelRows, mode, coupon) {
+  // source: 'pdf' | 'excel'（v1.8：Excel 流缺货行不写回单价/整箱批发价）
+  function applyPdfByMode(pdfRows, excelRows, mode, coupon, source) {
     var factor = (coupon === 0 || coupon === null || coupon === undefined) ? 1 : 0.9
-    var changes = (mode === "single") ? applyPdfSingle(pdfRows, excelRows, factor) : applyPdfSet(pdfRows, excelRows, factor)
+    var changes = (mode === "single") ? applyPdfSingle(pdfRows, excelRows, factor, source) : applyPdfSet(pdfRows, excelRows, factor, source)
     for (var i = 0; i < changes.length; i++) changes[i].mode = mode
     return changes
   }
@@ -1708,7 +1722,7 @@
       }
       pdfState.excelRows = excelRows
       pdfState.excelFileName = file.name
-      pdfState.changes = applyPdfByMode(pdfState.pdfRows, excelRows, pdfState.mode, pdfState.coupon)
+      pdfState.changes = applyPdfByMode(pdfState.pdfRows, excelRows, pdfState.mode, pdfState.coupon, "pdf")
       refreshCard()
       showToast("匹配完成，可点击预览", "success")
     } catch (err) {
@@ -1764,7 +1778,7 @@
       }
       excelState.excelRows = excelRows
       excelState.excelFileName = file.name
-      excelState.changes = applyPdfByMode(excelState.convRows, excelRows, excelState.mode, excelState.coupon)
+      excelState.changes = applyPdfByMode(excelState.convRows, excelRows, excelState.mode, excelState.coupon, "excel")
       refreshCard()
       showToast("匹配完成，可点击预览", "success")
     } catch (err) {
