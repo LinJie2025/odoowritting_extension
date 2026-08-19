@@ -26,6 +26,7 @@
 | 两条流程 | ✅ **双 Tab（v1.7.0）**：📊 **Excel 导入**（上传「PDF 转换版 Excel」→ `parseConvertedPdfExcel` 解析 → 再传采购订单 Excel → 与 PDF 同逻辑 `applyPdfByMode` → Modal 写回）+ 📄 **PDF 修正**（上传 PDF+Excel → `applyPdfByMode` 匹配修正 → Modal 写回）；两流在 `applyPdfByMode` 汇合，共用 `parseOrderExcel` / `loadOrderLineMap` / `buildPreviewRows` / `buildPdfPreviewModal` / `executePdfUpdate` |
 | 注入条件 | 仅 URL hash 含 `model=purchase.order` 的页面注入按钮 |
 | 价格规则 | 整箱批发价 = PDF Subtotal × 0.9，整数分运算（`calcBoxPrice`） |
+| 缺货写回 | ⚠️ **v1.8.0**：**Excel 入口**缺货行（备注「缺货」）的**单价/整箱批发价不写回 Odoo**（预览仍显示计算值）；PDF 入口不变。实现：`applyPdfByMode` 传 `source`（'pdf'/'excel'），缺货行价格字段 `odooField` 置 null |
 | 套装扣减 | ⚠️ 已作废（v1.5.0 起改为求和比对 + modal 提示，不自动扣减） |
 | ❌ 未实现 | 无重大未实现项；待办见 docs/PROJECT.md §9（Excel 公式列缓存值待真实样本验证、v1.7.0 待 Chrome 冒烟） |
 | Git | Conventional Commits（husky+commitlint 强制），scope 建议 `excel`/`ui`/`import`/`config`/`pdf` |
@@ -43,5 +44,6 @@
 ## 当前最高优先级待办
 
 - [x] **Excel 导入入口改造**（v1.7.0 已实现）：吃「PDF 转换版 Excel」，比对逻辑与 PDF 流完全一致（格式 A/B + Coupon + 两步上传，详见 docs/PROJECT.md §6.3）
-- [ ] **Chrome 冒烟验证 v1.7.0**：双 Tab 切换、Excel 流（转换版解析/两步上传/预览/写回）、PDF 流回归
+- [x] **Excel 入口缺货行不写回价格**（v1.8.0 已实现）：备注「缺货」的行跳过单价/整箱批发价写回，PDF 流不变（详见 docs/PROJECT.md §6.2）
+- [ ] **Chrome 冒烟验证 v1.8.0**：双 Tab 切换、Excel 流（转换版解析/两步上传/预览/缺货行写回）、PDF 流回归
 - [ ] `searchPoByName`/`searchPoByRef` 去重合并（低优先，保留无害）

@@ -1,7 +1,7 @@
 # Odoo Excel Importer — 项目文档
 
 > 本文件是项目的**权威文档**，与代码同步维护。任何 Agent 接任务前必须先读本文件。
-> 最后更新：2026-08-19（manifest v1.7.2）
+> 最后更新：2026-08-19（manifest v1.8.0）
 
 ---
 
@@ -15,7 +15,7 @@
 | 技术栈 | 纯原生 JS（**ES5 风格：`var` + IIFE + function 声明**），无框架、无构建步骤 |
 | 第三方库 | `lib/xlsx.full.min.js`（SheetJS）、`lib/pdf.min.js` + `lib/pdf.worker.min.js`（pdfjs-dist **3.11.174 UMD 版**，4.x 起无 UMD 故锁定 3.x） |
 | 运行环境 | 任意 Odoo 实例的 `purchase.order` 页面（URL hash 含 `model=purchase.order`） |
-| 版本 | manifest v1.7.2 |
+| 版本 | manifest v1.8.0 |
 
 **核心价值**：人工核对采购数据 → 自动写回 Odoo 的「数量 / 包装数量 / 整箱批发价 / 备注」字段，避免逐行手工录入。
 
@@ -157,6 +157,7 @@ odoowritting_extension/
 > - ×0.9 开关：`Coupon=0` → factor=1（不打折）；`Coupon≠0`（负数）→ factor=0.9
 > - 数量核对（v1.7.5）：**按 SKU（优先）/ UPC（兜底）分组**求和 Excel「abw交货箱数」 vs **PDF Qty 总和**（同一转换版行被多个订单关联命中时 PDF Qty 只计一次；SKU 缺失退回按 UPC 分组）。同 SKU 拆多个订单关联/多个 UPC（如 A 关联 1 件 + B 关联 18 件 = 19 件）合并比对，不再各自报错；不一致 modal 提示（不自动扣减）
 > - 缺货备注：① abw交货箱数为空/0；② Excel 有而 PDF 无 → 都备注「缺货」写 remark
+> - **缺货行写回（v1.8.0 改，2026-08-19 用户需求）**：**Excel 入口**缺货行（备注「缺货」）的**单价（price_unit）/ 整箱批发价（box_wholesale_price）不写回 Odoo**（预览仍显示计算值供核对，写回时跳过）；PDF 入口行为不变（缺货行价格照常写回）。实现：`applyPdfByMode` 增加 `source` 参数（'pdf'/'excel'），`applyPdfSingle`/`applyPdfSet` 中缺货行（boxQty 空/0）对应价格字段 `odooField` 置 null
 >
 > **单件入口（不变）**：单价 = `UNIT PRICE × factor` → 比对「单价」列 → 写回 `price_unit`
 >
@@ -265,7 +266,7 @@ odoowritting_extension/
 - Coupon：含「Coupon」单元格所在行右侧首个数值（样本 = -73702.326 → factor 0.9）；无 Coupon 行 → 0（factor 1）
 - 返回 `{ format, coupon, rows:[{upc,catalog,qty,unitPrice,subtotal,description}] }` —— 与 `extractPdfTable` 输出同构，直接喂给 `applyPdfByMode`
 
-**写回字段 / 比对规则 / 缺货规则 / Modal 交互**：与 PDF 流（§6.2）完全一致，不再单独维护。Modal 的 `mode` 改为优先取预览行自带标记（`previewRows[0].mode`），`fieldOrder` 的 excel 分支已移除。
+**写回字段 / 比对规则 / 缺货规则 / Modal 交互**：与 PDF 流（§6.2）完全一致，不再单独维护。**例外（v1.8.0）**：Excel 流缺货行（备注「缺货」）的单价/整箱批发价不写回 Odoo，详见 §6.2 ⚠️ 块。Modal 的 `mode` 改为优先取预览行自带标记（`previewRows[0].mode`），`fieldOrder` 的 excel 分支已移除。
 
 **样本实测（2026-08-19，node 单测）**：`Castlers Box 08.27_Order Confirmation_35548880.xlsx` → 格式 B、Coupon=-73702.326、64 行、UPC 全部合法、description 含 xN（套装单件数量）、Subtotal=UnitPrice×Qty 验算通过。
 
