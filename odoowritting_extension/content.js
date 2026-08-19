@@ -37,7 +37,8 @@
     total09: "0.9总价",              // 0.9总价（已取消比对，保留列定义）
     unitPrice: "单价",               // 单价 → price_unit
     remark: "备注",
-    orderRef: "订单关联"
+    orderRef: "订单关联",
+    partnerRef: "参考号"             // 参考号（2026-08-19 新增：查 PO 优先用它，查不到再用订单关联；两者都匹配 Odoo name 字段）
   }
 
   // ═══════════════════════════════════════════
@@ -116,7 +117,7 @@
   // 不一致原因字典（modal 悬浮展示，2026-08-18 用户需求）
   var REASONS = {
     qtySum: function (sum, target) {
-      return "数量不一致：abw交货箱数合计 " + fmtNum(sum) + " ≠ PDF Qty " + fmtNum(target)
+      return "数量不一致：abw交货箱数合计 " + fmtNum(sum) + " ≠ 供应商 Qty " + fmtNum(target)
     },
     unitPrice: function (computed, expr, old) {
       return "单价不一致：计算 " + expr + " = " + fmtNum(computed) + " ≠ Excel " + fmtNum(old)
@@ -131,20 +132,7 @@
       return "0.9总价不一致：计算 " + expr + " = " + fmtNum(computed) + " ≠ Excel " + fmtNum(old)
     },
     boxQtyEmpty: "abw交货箱数为空或 0，标记缺货",
-    outstock: "Excel 有该 UPC/Catalog，但 PDF 中不存在",
-    // Excel 入口：Excel 值 vs Odoo 现有值比对（2026-08-18）
-    excelBoxQty: function (newVal, oldVal) {
-      return "abw交货箱数不一致：Excel " + fmtNum(newVal) + " ≠ Odoo " + fmtNum(oldVal)
-    },
-    excelUnitPrice: function (newVal, oldVal) {
-      return "单价不一致：Excel " + fmtNum(newVal) + " ≠ Odoo " + fmtNum(oldVal)
-    },
-    excelBoxPrice09: function (newVal, oldVal) {
-      return "0.9箱规价不一致：Excel " + fmtNum(newVal) + " ≠ Odoo " + fmtNum(oldVal)
-    },
-    excelRemark: function (newVal, oldVal) {
-      return "备注不一致：Excel「" + newVal + "」≠ Odoo「" + oldVal + "」"
-    }
+    outstock: "Excel 有该 UPC/Catalog，但 PDF 中不存在"
   }
 
   // 计算表达式展示（factor=1 时省略 ×1）
@@ -519,9 +507,11 @@
       total09: colIdx(EXCEL_COLS.total09),
       unitPrice: colIdx(EXCEL_COLS.unitPrice),
       remark: colIdx(EXCEL_COLS.remark),
-      orderRef: colIdx(EXCEL_COLS.orderRef)
+      orderRef: colIdx(EXCEL_COLS.orderRef),
+      partnerRef: colIdx(EXCEL_COLS.partnerRef)
     }
     if (idx.upc < 0) idx.upc = colIdxFuzzy(["内部参考号", "UPC", "EAN"])
+    if (idx.partnerRef < 0) idx.partnerRef = colIdxFuzzy(["参考号", "Reference", "reference"])
     // 「包装/SKU」优先于「Box SKU」——两者都含 "SKU"，若按含 SKU 兜底会先命中 Box SKU 列（2026-08-18 修复）
     if (idx.catalog < 0) idx.catalog = colIdxFuzzy(["包装/SKU", "SKU_x", "SKU", "Catalog", "货号"])
     if (idx.upc < 0) throw new Error("未找到 UPC 列（「" + EXCEL_COLS.upc + "」）")
@@ -545,29 +535,111 @@
         total09: parseFloatNum(cell(row, idx.total09)),
         unitPrice: parseFloatNum(cell(row, idx.unitPrice)),
         remark: String(cell(row, idx.remark)).trim(),
-        orderRef: String(cell(row, idx.orderRef)).trim()
+        orderRef: String(cell(row, idx.orderRef)).trim(),
+        partnerRef: String(cell(row, idx.partnerRef)).trim()
       })
     }
     return result
   }
 
-  // ── 通用匹配：PDF 行按 UPC 或 Catalog 任一命中 Excel 行 ──
+  // 解析「PDF 转换版 Excel」（2026-08-19 Excel 入口改造：输出与 extractPdfTable 同构，供 applyPdfByMode 复用）
+  // 表头行 = 首个含 UPC/EAN 关键字的行；格式按表头有无 HS CODE 分 A/B；列按表头名正则定位（容忍空列/用户附加列）；
+  // 数据行 = UPC 列为 8~14 位纯数字的行（汇总区/说明文字自然跳过）；Coupon 从汇总区单独提取（决定 ×0.9）
+  function parseConvertedPdfExcel(data) {
+    var wb = XLSX.read(data, { type: "array" })
+    var ws = wb.Sheets[wb.SheetNames[0]]
+    var grid = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "" })
+    function s(v) { return (v === undefined || v === null) ? "" : String(v).trim() }
+
+    // 1. 定位表头行
+    var headerIdx = -1
+    for (var i = 0; i < grid.length; i++) {
+      var row = grid[i] || []
+      for (var j = 0; j < row.length; j++) {
+        if (/UPC|EAN/i.test(s(row[j]))) { headerIdx = i; break }
+      }
+      if (headerIdx >= 0) break
+    }
+    if (headerIdx < 0) throw new Error("未识别到表格表头（UPC/EAN）——请确认上传的是 PDF 转换版 Excel")
+
+    // 2. 格式识别（有无 HS CODE）+ 关键列定位
+    var header = (grid[headerIdx] || []).map(function (h) { return s(h) })
+    var hasHsCode = false
+    for (var h = 0; h < header.length; h++) {
+      if (/HS\s*CODE/i.test(header[h])) { hasHsCode = true; break }
+    }
+    function findCol(re) {
+      for (var j = 0; j < header.length; j++) if (re.test(header[j])) return j
+      return -1
+    }
+    var upcCol = findCol(/UPC|EAN/i)
+    var catCol = findCol(/Catalog/i)
+    var qtyCol = findCol(/Qty/i)
+    var priceCol = findCol(/Unit\s*Price/i)
+    var subCol = findCol(/Subtotal/i)
+    var descCol = findCol(/Product\s*Description/i)
+
+    // 3. 数据行（重复表头行跳过：跨页 PDF 转 Excel 可能每页重复表头）
+    var digitRe = /^\d{8,14}$/
+    var rows = []
+    for (var r = headerIdx + 1; r < grid.length; r++) {
+      var g = grid[r] || []
+      var upc = s(g[upcCol])
+      if (/UPC|EAN/i.test(upc)) continue
+      if (!digitRe.test(upc)) continue
+      rows.push({
+        upc: upc,
+        catalog: catCol >= 0 ? s(g[catCol]) : "",
+        qty: qtyCol >= 0 ? s(g[qtyCol]) : "",
+        unitPrice: priceCol >= 0 ? s(g[priceCol]) : "",
+        subtotal: subCol >= 0 ? s(g[subCol]) : "",
+        description: descCol >= 0 ? s(g[descCol]) : ""
+      })
+    }
+    if (!rows.length) throw new Error("表头已识别，但未找到数据行（UPC 需为 8~14 位纯数字）")
+
+    // 4. Coupon：含「Coupon」单元格所在行，取其右侧首个数值（无则 0 → 不 ×0.9）
+    var coupon = 0
+    var couponFound = false
+    for (var cr = 0; cr < grid.length && !couponFound; cr++) {
+      var grow = grid[cr] || []
+      for (var gc = 0; gc < grow.length && !couponFound; gc++) {
+        if (!/^Coupon$/i.test(s(grow[gc]))) continue
+        for (var nc = gc + 1; nc < grow.length; nc++) {
+          var nv = parseFloat(s(grow[nc]).replace(/[^\d.-]/g, ""))
+          if (!isNaN(nv)) { coupon = nv; couponFound = true; break }
+        }
+        couponFound = true   // Coupon 行无数值也视为已处理（coupon 保持 0）
+      }
+    }
+
+    return { format: hasHsCode ? "B" : "A", coupon: coupon, rows: rows }
+  }
+
+  // ── 通用匹配（v1.7.2）：主匹配 = PDF Catalog（格式B「CATALOG NO.」/格式A「Catalog#」，解析器已统一提取为 catalog 字段）↔ Excel「SKU」列 ──
+  // Excel 行 SKU（catalog）有值 → 只按 SKU 匹配（不参与 UPC 匹配）；SKU 缺失 → 用 PDF UPC ↔ Excel「内部参考号」列兜底
   function matchPdfToExcel(pdfRows, excelRows) {
-    var byUpc = {}, byCatalog = {}
+    var bySku = {}, byUpc = {}
     for (var i = 0; i < excelRows.length; i++) {
       var e = excelRows[i]
-      if (e.upc) { if (!byUpc[e.upc]) byUpc[e.upc] = []; byUpc[e.upc].push(e) }
-      if (e.catalog) { if (!byCatalog[e.catalog]) byCatalog[e.catalog] = []; byCatalog[e.catalog].push(e) }
+      if (e.catalog) {
+        if (!bySku[e.catalog]) bySku[e.catalog] = []
+        bySku[e.catalog].push(e)
+      } else if (e.upc) {
+        // Excel 的 SKU 缺失 → 仅可被 UPC 兜底匹配
+        if (!byUpc[e.upc]) byUpc[e.upc] = []
+        byUpc[e.upc].push(e)
+      }
     }
     var pairs = []
     var matchedIdx = {}
     for (var j = 0; j < pdfRows.length; j++) {
       var p = pdfRows[j]
       var hits = {}
+      var lc = bySku[p.catalog] || []
       var lu = byUpc[p.upc] || []
-      var lc = byCatalog[p.catalog] || []
-      for (var a = 0; a < lu.length; a++) hits[lu[a].rowIndex] = lu[a]
-      for (var b = 0; b < lc.length; b++) hits[lc[b].rowIndex] = lc[b]
+      for (var a = 0; a < lc.length; a++) hits[lc[a].rowIndex] = lc[a]
+      for (var b = 0; b < lu.length; b++) hits[lu[b].rowIndex] = lu[b]
       var keys = Object.keys(hits)
       for (var k = 0; k < keys.length; k++) {
         var ex = hits[keys[k]]
@@ -600,25 +672,46 @@
     return calcBoxPrice(n)
   }
 
-  // 按 UPC 分组求和 abw交货箱数（多条店铺），标记数量是否一致
+  // 数量核对：按 SKU（优先）/ UPC（兜底）分组求和 abw交货箱数，标记是否一致
+  // v1.7.5：聚合键与 matchPdfToExcel 匹配键对齐——同一 SKU 拆多个订单关联/多个 UPC（如 A 关联 1 件 + B 关联 18 件 = 19 件）时合并求和 vs PDF Qty 总和
   // v1.5（2026-08-18）：目标 = PDF Qty 原值，不区分格式、不再 ÷pieces（用户确认「abw交货箱数就是Qty列的数」）
   function markQtyMismatch(pairs) {
-    var byUpc = {}
+    var byKey = {}
     for (var i = 0; i < pairs.length; i++) {
-      var key = pairs[i].pdf.upc
-      if (!byUpc[key]) byUpc[key] = []
-      byUpc[key].push(pairs[i])
+      // SKU 有值按 SKU 聚合（同 SKU 跨 UPC/跨订单关联合并）；SKU 缺失退回 UPC（与匹配兜底一致）
+      var key = pairs[i].pdf.catalog || pairs[i].pdf.upc || ("row-" + i)
+      if (!byKey[key]) byKey[key] = []
+      byKey[key].push(pairs[i])
     }
-    for (var k in byUpc) {
-      var list = byUpc[k]
-      var rawTarget = parseInt(list[0].pdf.qty, 10)
-      var target = isNaN(rawTarget) ? null : rawTarget
+    for (var k in byKey) {
+      var list = byKey[k]
+      var target = 0, targetOk = true
       var sum = 0
-      for (var s = 0; s < list.length; s++) sum += (list[s].excel.boxQty || 0)
+      var seenPdf = []   // 同一转换版行被多个订单关联命中时，PDF Qty 只累计一次
+      var detailMap = {} // 悬浮明细：按订单关联聚合（同 SKU 多条相加时展示「哪几个订单关联各多少」）
+      for (var s = 0; s < list.length; s++) {
+        var ex = list[s].excel
+        var q = ex.boxQty || 0
+        sum += q
+        if (q > 0) {
+          var ref = ex.orderRef || ex.partnerRef || ""
+          if (!detailMap[ref]) detailMap[ref] = { ref: ref, sku: list[s].pdf.catalog || list[s].pdf.upc || "", qty: 0 }
+          detailMap[ref].qty += q
+        }
+        var pd = list[s].pdf
+        if (seenPdf.indexOf(pd) >= 0) continue
+        seenPdf.push(pd)
+        var rawT = parseInt(pd.qty, 10)
+        if (isNaN(rawT)) { targetOk = false; continue }
+        target += rawT
+      }
+      var detail = []
+      for (var dk in detailMap) detail.push(detailMap[dk])
       for (var t = 0; t < list.length; t++) {
-        list[t].qtyTarget = target
+        list[t].qtyTarget = targetOk ? target : null
         list[t].qtySum = sum
-        list[t].qtyMismatch = target !== null && !numEq(sum, target)
+        list[t].qtyMismatch = targetOk && !numEq(sum, target)
+        list[t].qtyDetail = detail
       }
     }
   }
@@ -654,8 +747,8 @@
         pdfRaw: pdfRaw
       })
       changes.push({
-        kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef,
-        qtyTarget: pair.qtyTarget, qtySum: pair.qtySum, qtyMismatch: pair.qtyMismatch,
+        kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef, partnerRef: ex.partnerRef,
+        qtyTarget: pair.qtyTarget, qtySum: pair.qtySum, qtyMismatch: pair.qtyMismatch, qtyDetail: pair.qtyDetail,
         fields: fields
       })
     }
@@ -663,7 +756,7 @@
     for (var q = 0; q < m.outstock.length; q++) {
       var er = m.outstock[q]
       changes.push({
-        kind: "outstock", upc: er.upc, catalog: er.catalog, shop: er.shop, orderRef: er.orderRef,
+        kind: "outstock", upc: er.upc, catalog: er.catalog, shop: er.shop, orderRef: er.orderRef, partnerRef: er.partnerRef,
         qtyTarget: null, qtySum: null, qtyMismatch: false,
         fields: [{ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock }]
       })
@@ -748,8 +841,8 @@
       })
 
       changes.push({
-        kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef,
-        qtyTarget: pair.qtyTarget, qtySum: pair.qtySum, qtyMismatch: pair.qtyMismatch,
+        kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef, partnerRef: ex.partnerRef,
+        qtyTarget: pair.qtyTarget, qtySum: pair.qtySum, qtyMismatch: pair.qtyMismatch, qtyDetail: pair.qtyDetail,
         fields: fields
       })
     }
@@ -757,7 +850,7 @@
     for (var q = 0; q < m.outstock.length; q++) {
       var er = m.outstock[q]
       changes.push({
-        kind: "outstock", upc: er.upc, catalog: er.catalog, shop: er.shop, orderRef: er.orderRef,
+        kind: "outstock", upc: er.upc, catalog: er.catalog, shop: er.shop, orderRef: er.orderRef, partnerRef: er.partnerRef,
         qtyTarget: null, qtySum: null, qtyMismatch: false,
         fields: [{ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock }]
       })
@@ -773,72 +866,9 @@
     return changes
   }
 
-  // ── Excel 入口（2026-08-18）：无 PDF，写回目标 = Excel 现有值；比对 Odoo 订单行现有值 ──
-  // 单件：abw交货箱数 + 单价 + 备注；套装：+ 0.9箱规价（用户确认）
-  // lineMap: { ref|upc: {id, name, price_unit, box_wholesale_price, packaging_qty, remark} }
-  function applyExcelChanges(excelRows, lineMap, mode) {
-    var changes = []
-    for (var i = 0; i < excelRows.length; i++) {
-      var ex = excelRows[i]
-      var line = lineMap[ex.orderRef + "|" + ex.upc] || null
-      var fields = []
-      var odooRaw = line ? "Odoo 行: " + line.name : ""   // 悬浮第一行（替换 PDF 流的 pdfRaw 位）
-
-      // abw交货箱数（单件/套装都写回 product_packaging_qty）
-      var newBoxQty = ex.boxQty
-      var oldBoxQty = line ? line.packaging_qty : null
-      var boxQtyChanged = newBoxQty !== null && !numEq(oldBoxQty, newBoxQty)
-      fields.push({
-        key: "boxQty", label: "abw交货箱数", odooField: ODOO_FIELDS.boxQty,
-        oldValue: oldBoxQty, newValue: newBoxQty, changed: boxQtyChanged,
-        reason: boxQtyChanged ? REASONS.excelBoxQty(newBoxQty, oldBoxQty) : null,
-        pdfRaw: odooRaw
-      })
-
-      // 单价（单件/套装都写回 price_unit）
-      var newUnit = ex.unitPrice
-      var oldUnit = line ? line.price_unit : null
-      var unitChanged = newUnit !== null && !numEq(oldUnit, newUnit)
-      fields.push({
-        key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice,
-        oldValue: oldUnit, newValue: newUnit, changed: unitChanged,
-        reason: unitChanged ? REASONS.excelUnitPrice(newUnit, oldUnit) : null,
-        pdfRaw: odooRaw
-      })
-
-      // 0.9箱规价（仅套装写回 box_wholesale_price）
-      if (mode === "set") {
-        var newBox09 = ex.boxPrice09
-        var oldBox09 = line ? line.box_wholesale_price : null
-        var box09Changed = newBox09 !== null && !numEq(oldBox09, newBox09)
-        fields.push({
-          key: "boxPrice09", label: "0.9箱规价", odooField: ODOO_FIELDS.boxWholesalePrice,
-          oldValue: oldBox09, newValue: newBox09, changed: box09Changed,
-          reason: box09Changed ? REASONS.excelBoxPrice09(newBox09, oldBox09) : null,
-          pdfRaw: odooRaw
-        })
-      }
-
-      // 备注（仅 Excel 有值时写回，避免空值清空 Odoo 备注）
-      if (ex.remark) {
-        var oldRemark = line ? (line.remark || "") : ""
-        var remarkChanged = oldRemark !== ex.remark
-        fields.push({
-          key: "remark", label: "备注", odooField: ODOO_FIELDS.remark,
-          oldValue: oldRemark, newValue: ex.remark, changed: remarkChanged,
-          reason: remarkChanged ? REASONS.excelRemark(ex.remark, oldRemark) : null,
-          pdfRaw: odooRaw
-        })
-      }
-
-      changes.push({
-        kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef,
-        qtyTarget: null, qtySum: null, qtyMismatch: false, mode: mode,
-        fields: fields
-      })
-    }
-    return changes
-  }
+  // ── Excel 入口比对逻辑（2026-08-19 改造）：与 PDF 流完全一致 ──
+  // 转换版 Excel 经 parseConvertedPdfExcel 解析后与 PDF 表格同构，直接走 applyPdfByMode（单件/套装同一套公式）。
+  // 旧 applyExcelChanges（Excel 值 vs Odoo 现有值）已移除。
 
   // ═══════════════════════════════════════════
   //  业务逻辑（Excel 导入流匹配/预览逻辑已移除，待重新对齐后重写）
@@ -896,12 +926,16 @@
     error: null          // 当前步骤错误信息（常驻显示，下次成功时清除）
   }
 
-  // Excel 导入区流程状态（2026-08-18 新增：上传 Excel → 比对 Odoo 现有值 → 预览写回）
+  // Excel 导入区流程状态（2026-08-19 改造：上传「PDF 转换版 Excel」→ 再传采购订单 Excel → 与 PDF 流同逻辑比对写回）
   var excelState = {
     mode: null,          // 入口: null | 'single' | 'set'
-    excelRows: null,     // Excel 解析结果
+    convRows: null,      // 转换版 Excel 解析出的表格数据行（与 extractPdfTable 输出同构）
+    convFileName: null,
+    convFormat: null,    // 格式: 'A'(无HS CODE) | 'B'(有HS CODE)
+    coupon: 0,           // 汇总区 Coupon 值（决定是否 ×0.9）
+    excelRows: null,     // 采购订单 Excel 解析结果
     excelFileName: null,
-    changes: null,       // applyExcelChanges 结果（含 lineMap 比对）
+    changes: null,       // applyPdfByMode 结果（与 PDF 流同一逻辑）
     error: null
   }
 
@@ -1271,8 +1305,8 @@
       // 步骤1：上传 PDF
       wrap.appendChild(makeDropZone("点击上传或拖拽 PDF", "支持 .pdf（文本型，非扫描件）", "📄", "pdf", function (file) { processPdfFile(file) }))
     } else if (!pdfState.excelRows) {
-      // 步骤2：上传 Excel
-      wrap.appendChild(makeDropZone("请上传采购订单 Excel", "支持 .xlsx / .xls", "📊", "excel", function (file) { processPdfExcelFile(file) }))
+      // 步骤2：上传 Excel（匹配规则与 Excel 入口一致：SKU 优先、UPC 兜底，v1.7.2）
+      wrap.appendChild(makeDropZone("请上传采购订单 Excel", "需含 SKU 列（优先匹配）与内部参考号列（SKU 缺失兜底）", "📊", "excel", function (file) { processPdfExcelFile(file) }))
     } else {
       // 步骤3：预览 + 重置
       var btnRow = el("div", { style: "display:flex;gap:8px" }, [
@@ -1393,7 +1427,8 @@
   }
 
   // ═══════════════════════════════════════════
-  //  3c. Excel 导入区 UI（2026-08-18：上传 Excel → 比对 Odoo 现有值 → 预览写回）
+  //  3c. Excel 导入区 UI（2026-08-19 改造：与 PDF 流完全一致——
+  //      上传「PDF 转换版 Excel」→ 上传采购订单 Excel → 预览写回）
   // ═══════════════════════════════════════════
   function renderExcelZone() {
     var wrap = el("div", { style: "margin:12px 16px;display:flex;flex-direction:column;gap:10px" })
@@ -1419,21 +1454,63 @@
       }, "⚠️ " + excelState.error))
     }
 
+    // 步骤指示器：① 上传转换版 Excel → ② 上传采购订单 Excel → ③ 预览确认（已完成步骤可点击回退）
+    if (excelState.mode) {
+      var step = excelState.convRows ? (excelState.excelRows ? 3 : 2) : 1
+      var steps = [
+        { n: 1, label: "上传转换版 Excel", icon: "📑" },
+        { n: 2, label: "上传采购订单 Excel", icon: "📊" },
+        { n: 3, label: "预览确认", icon: "👁" }
+      ]
+      var stepBar = el("div", { style: "display:flex;align-items:center;gap:6px;font-size:11px" })
+      for (var si = 0; si < steps.length; si++) {
+        (function (s) {
+          var done = s.n < step, active = s.n === step
+          var clickable = done
+          var chipStyle = "flex:1;text-align:center;padding:6px 4px;border-radius:6px;border:1px solid " +
+            (active ? "#7c3aed" : (done ? "#a7f3d0" : "#e5e7eb")) + ";background:" +
+            (active ? "#f5f3ff" : (done ? "#f0fdf4" : "#f9fafb")) + ";color:" +
+            (active ? "#7c3aed" : (done ? "#059669" : "#9ca3af")) + ";font-weight:" + (active ? "600" : "400") +
+            (clickable ? ";cursor:pointer;transition:background 0.15s,border-color 0.15s" : ";cursor:default")
+          var chipAttrs = { style: chipStyle, title: clickable ? "点击返回此步骤重新上传" : "" }
+          if (clickable) {
+            chipAttrs.onclick = function () { jumpExcelStep(s.n) }
+            chipAttrs.onmouseenter = function () { chip.style.background = "#ecfdf5"; chip.style.borderColor = "#34d399" }
+            chipAttrs.onmouseleave = function () { chip.style.background = "#f0fdf4"; chip.style.borderColor = "#a7f3d0" }
+          }
+          var chip = el("div", chipAttrs, (done ? "✅" : "") + s.icon + " " + s.label)
+          stepBar.appendChild(chip)
+        })(steps[si])
+        if (si < steps.length - 1) {
+          stepBar.appendChild(el("span", { style: "color:#d1d5db" }, "→"))
+        }
+      }
+      wrap.appendChild(stepBar)
+    }
+
     // 状态提示
+    if (excelState.convRows) {
+      wrap.appendChild(el("div", {
+        style: "font-size:12px;color:#059669;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px 10px"
+      }, "✅ 转换版 Excel 已解析：" + (excelState.convFileName || "") + "（" + excelState.convRows.length + " 行，格式" + (excelState.convFormat || "?") + (excelState.coupon ? "，Coupon=" + excelState.coupon : "") + "）"))
+    }
     if (excelState.excelRows) {
       wrap.appendChild(el("div", {
         style: "font-size:12px;color:#059669;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px 10px"
-      }, "✅ Excel 已解析：" + (excelState.excelFileName || "") + "（" + excelState.excelRows.length + " 行）"))
+      }, "✅ 采购订单 Excel 已解析：" + (excelState.excelFileName || "") + "（" + excelState.excelRows.length + " 行）"))
     }
 
     if (!excelState.mode) {
       // 步骤0：选择入口（单件 / 套装，与 PDF 区共用选择器）
       wrap.appendChild(renderModePicker(selectExcelMode))
+    } else if (!excelState.convRows) {
+      // 步骤1：上传转换版 Excel（PDF 转的 Excel，含 UPC/EAN 表头）
+      wrap.appendChild(makeDropZone("点击上传或拖拽转换版 Excel", "PDF 转成的 Excel（.xlsx / .xls），含 UPC/EAN 表头", "📑", "excel", function (file) { processExcelFile(file) }))
     } else if (!excelState.excelRows) {
-      // 步骤1：上传 Excel
-      wrap.appendChild(makeDropZone("请上传采购订单 Excel", "支持 .xlsx / .xls", "📊", "excel", function (file) { processExcelFile(file) }))
+      // 步骤2：上传采购订单 Excel（匹配规则与 PDF 流一致：SKU 优先、UPC 兜底，v1.7.2）
+      wrap.appendChild(makeDropZone("请上传采购订单 Excel", "需含 SKU 列（优先匹配）与内部参考号列（SKU 缺失兜底）", "📊", "excel", function (file) { processExcelOrderFile(file) }))
     } else {
-      // 步骤2：预览（比对 Odoo 现有值）+ 重置
+      // 步骤3：预览 + 重置
       var btnRow = el("div", { style: "display:flex;gap:8px" }, [
         el("button", {
           onclick: function () { previewExcelChanges() },
@@ -1458,6 +1535,10 @@
 
   function clearExcelData() {
     excelState.mode = null
+    excelState.convRows = null
+    excelState.convFileName = null
+    excelState.convFormat = null
+    excelState.coupon = 0
     excelState.excelRows = null
     excelState.excelFileName = null
     excelState.changes = null
@@ -1466,6 +1547,28 @@
 
   function resetExcelState() {
     clearExcelData()
+    refreshCard()
+  }
+
+  // 步骤条跳转（Excel 流）：1=上传转换版 Excel, 2=上传采购订单 Excel, 3=预览确认
+  function jumpExcelStep(target) {
+    if (target === 1) {
+      excelState.convRows = null
+      excelState.convFileName = null
+      excelState.convFormat = null
+      excelState.coupon = 0
+      excelState.excelRows = null
+      excelState.excelFileName = null
+      excelState.changes = null
+      excelState.error = null
+    } else if (target === 2) {
+      if (!excelState.convRows) return
+      excelState.excelRows = null
+      excelState.excelFileName = null
+      excelState.changes = null
+    } else if (target === 3) {
+      if (!excelState.convRows || !excelState.excelRows) return
+    }
     refreshCard()
   }
 
@@ -1616,47 +1719,71 @@
     }
   }
 
-  // ── Excel 导入流：上传 Excel → 解析 → 预览（比对 Odoo 现有值）──
+  // ── Excel 导入流（2026-08-19 改造：与 PDF 流同逻辑）──
+  // 步骤1：上传「PDF 转换版 Excel」→ parseConvertedPdfExcel（格式A/B + Coupon + 表格行）
   async function processExcelFile(file) {
+    try {
+      showToast("解析转换版 Excel 中...", "info")
+      excelState.error = null
+      var data = await file.arrayBuffer()
+      var result = parseConvertedPdfExcel(data)
+      if (!result.rows.length) {
+        excelState.error = "转换版 Excel 中未找到表格数据（0 行）"
+        refreshCard()
+        showToast(excelState.error, "error")
+        return
+      }
+      excelState.convRows = result.rows
+      excelState.convFileName = file.name
+      excelState.convFormat = result.format
+      excelState.coupon = result.coupon || 0
+      excelState.excelRows = null
+      excelState.excelFileName = null
+      excelState.changes = null
+      refreshCard()
+      showToast("转换版 Excel 解析成功：" + result.rows.length + " 行（格式" + result.format + "，Coupon=" + excelState.coupon + "），请上传采购订单 Excel", "success")
+    } catch (err) {
+      excelState.error = err.message || String(err)
+      refreshCard()
+      showToast("转换版 Excel 解析失败: " + excelState.error, "error")
+      console.error("[Odoo Excel]", err)
+    }
+  }
+
+  // 步骤2：上传采购订单 Excel → 与 PDF 流同一套匹配修正逻辑（applyPdfByMode）
+  async function processExcelOrderFile(file) {
     try {
       excelState.error = null
       var data = await file.arrayBuffer()
       var excelRows = parseOrderExcel(data)
       if (!excelRows.length) {
-        excelState.error = "Excel 中没有有效数据"
+        excelState.error = "采购订单 Excel 中没有有效数据"
         refreshCard()
         showToast(excelState.error, "error")
         return
       }
       excelState.excelRows = excelRows
       excelState.excelFileName = file.name
-      excelState.changes = null
+      excelState.changes = applyPdfByMode(excelState.convRows, excelRows, excelState.mode, excelState.coupon)
       refreshCard()
-      showToast("Excel 解析成功：" + excelRows.length + " 行，可点击预览", "success")
+      showToast("匹配完成，可点击预览", "success")
     } catch (err) {
       excelState.error = err.message || String(err)
       refreshCard()
-      showToast("Excel 解析失败: " + excelState.error, "error")
+      showToast("采购订单 Excel 解析失败: " + excelState.error, "error")
       console.error("[Odoo Excel]", err)
     }
   }
 
-  // 预览：查 Odoo 订单行 → Excel 值 vs Odoo 现有值比对 → Modal（可编辑，不一致悬浮显示）
+  // 预览：查 Odoo 订单行 → Modal（与 PDF 流同一预览/写回通道）
   async function previewExcelChanges() {
-    if (!excelState.excelRows) return
+    if (!excelState.changes) return
     try {
       showToast("查询 Odoo 订单行中...", "info")
-      var orderRefs = {}
-      for (var i = 0; i < excelState.excelRows.length; i++) {
-        if (excelState.excelRows[i].orderRef) orderRefs[excelState.excelRows[i].orderRef] = true
-      }
-      var lineMap = await loadOrderLineMap(orderRefs)
-      var changes = applyExcelChanges(excelState.excelRows, lineMap, excelState.mode)
-      excelState.changes = changes
-      var previewRows = buildPreviewRows(changes, lineMap)
+      var previewRows = await buildPdfPreviewRows(excelState.changes)
       updateLoadingOverlay(null)
       var modeLabel = excelState.mode ? "[" + PDF_MODES[excelState.mode].label + "] " : ""
-      buildPdfPreviewModal(previewRows, modeLabel + excelState.excelFileName, "excel")
+      buildPdfPreviewModal(previewRows, modeLabel + excelState.convFileName + " + " + excelState.excelFileName)
     } catch (err) {
       updateLoadingOverlay(null)
       showToast("预览失败: " + (err.message || err), "error")
@@ -1664,34 +1791,43 @@
     }
   }
 
-  // 查订单关联 → PO → 订单行，构建 lineMap（key = ref|upc，两流共用）
-  async function loadOrderLineMap(orderRefs) {
+  // 查 PO → 订单行，构建 lineMap（key = ref|upc，两流共用）
+  // 2026-08-19：每行优先用「参考号」查 PO（两者都查 Odoo name 字段），查不到再用「订单关联」；命中行按两个键都注册
+  async function loadOrderLineMap(refPairs) {
     var lineMap = {}
-    var refs = Object.keys(orderRefs)
-    for (var r = 0; r < refs.length; r++) {
-      var ref = refs[r]
+    for (var r = 0; r < refPairs.length; r++) {
+      var orderRef = refPairs[r].orderRef, partnerRef = refPairs[r].partnerRef
       try {
-        var po = await searchPoByRef(ref)
+        var po = null
+        if (partnerRef) po = await searchPoByRef(partnerRef)   // 先匹配参考号
+        if (!po && orderRef) po = await searchPoByRef(orderRef) // 查不到再匹配订单关联
         if (po && po.orderLineIds.length) {
           var lines = await getOrderLines(po.orderLineIds)
           for (var j = 0; j < lines.length; j++) {
-            if (lines[j].upc) lineMap[ref + "|" + lines[j].upc] = lines[j]
+            if (!lines[j].upc) continue
+            if (orderRef) lineMap[orderRef + "|" + lines[j].upc] = lines[j]
+            if (partnerRef && partnerRef !== orderRef) lineMap[partnerRef + "|" + lines[j].upc] = lines[j]
           }
         }
       } catch (e) {
-        console.error("[Odoo Excel Importer] 查询失败 " + ref, e)
+        console.error("[Odoo Excel Importer] 查询失败 " + (partnerRef || orderRef), e)
       }
     }
     return lineMap
   }
 
-  // 构建 PDF 区预览行（含 Odoo 订单行匹配）
+  // 构建 PDF 区预览行（含 Odoo 订单行匹配；参考号/订单关联去重成 refPairs）
   async function buildPdfPreviewRows(changes) {
-    var orderRefs = {}
+    var seen = {}, refPairs = []
     for (var i = 0; i < changes.length; i++) {
-      if (changes[i].orderRef) orderRefs[changes[i].orderRef] = true
+      var c = changes[i]
+      if (!c.orderRef && !c.partnerRef) continue
+      var k = (c.partnerRef || "") + "|" + (c.orderRef || "")
+      if (seen[k]) continue
+      seen[k] = true
+      refPairs.push({ orderRef: c.orderRef || "", partnerRef: c.partnerRef || "" })
     }
-    var lineMap = await loadOrderLineMap(orderRefs)
+    var lineMap = await loadOrderLineMap(refPairs)
     return buildPreviewRows(changes, lineMap)
   }
 
@@ -1700,21 +1836,24 @@
     var previewRows = []
     for (var k = 0; k < changes.length; k++) {
       var c = changes[k]
-      var line = lineMap[c.orderRef + "|" + c.upc] || null
+      var line = (c.orderRef && lineMap[c.orderRef + "|" + c.upc]) ||
+                 (c.partnerRef && lineMap[c.partnerRef + "|" + c.upc]) || null
       var hasChanged = false
       for (var f = 0; f < c.fields.length; f++) { if (c.fields[f].changed) hasChanged = true }
+      // v1.7.7：数据一致（白底无标记）的行也可勾选写入；仅「未找到匹配的订单行」不可勾选
+      var lineErr = line ? null : "未找到匹配的订单行"
       previewRows.push({
         idx: k,
-        upc: c.upc, catalog: c.catalog, shop: c.shop, orderRef: c.orderRef,
+        upc: c.upc, catalog: c.catalog, shop: c.shop, orderRef: c.orderRef || c.partnerRef || "",
         mode: c.mode || null,
         odooLineId: line ? line.id : null,
         odooLineName: line ? line.name : null,
         kind: c.kind,
-        qtyTarget: c.qtyTarget, qtySum: c.qtySum, qtyMismatch: c.qtyMismatch,
+        qtyTarget: c.qtyTarget, qtySum: c.qtySum, qtyMismatch: c.qtyMismatch, qtyDetail: c.qtyDetail,
         fields: c.fields,
-        hasAction: hasChanged || c.qtyMismatch || c.kind === "outstock",
+        hasAction: !lineErr,
         checked: hasChanged || c.kind === "outstock",
-        error: line ? null : "未找到匹配的订单行"
+        error: lineErr
       })
     }
     // 按订单关联号排序
@@ -1746,13 +1885,8 @@
     }
   }
 
-  // 字段展示顺序（按入口 + 来源；Excel 流无 PDF 比对列 boxPrice/total09）
+  // 字段展示顺序（按入口；2026-08-19 起 Excel 流与 PDF 流同一布局，source 仅保留兼容签名）
   function fieldOrder(mode, source) {
-    if (source === "excel") {
-      var order = ["boxQty", "unitPrice"]
-      if (mode === "set") order = order.concat(["boxPrice09"])
-      return order.concat(["remark"])
-    }
     var order = ["boxQty", "unitPrice"]
     if (mode === "set") order = order.concat(["boxPrice", "boxPrice09", "total09"])
     return order.concat(["remark"])
@@ -1777,7 +1911,8 @@
   function buildPdfPreviewModal(previewRows, fileName, source) {
     removeModals()
     source = source || "pdf"
-    var mode = source === "excel" ? excelState.mode : pdfState.mode
+    // mode 优先取预览行自带标记（applyPdfByMode 已按入口盖章），兜底再读两流状态（2026-08-19：Excel 流也走 pdf 布局）
+    var mode = (previewRows.length && previewRows[0].mode) || (source === "excel" ? excelState.mode : pdfState.mode)
     var titleIcon = source === "excel" ? "📊" : "📄"
     // 去重订单关联号列表（2026-08-18 用户要求：显示具体关联号，如 P00393|P00395|...）
     var refSet = {}
@@ -1818,7 +1953,7 @@
     var qtyMis = previewRows.filter(function (r) { return r.qtyMismatch }).length
     modal.appendChild(el("div", {
       style: "padding:10px 20px;background:#f0f9ff;font-size:12px;color:#1e40af"
-    }, "共 " + previewRows.length + " 行  ·  " + actionable + " 行需处理" + (qtyMis > 0 ? "  ·  " + qtyMis + " 行数量不一致" : "") + (outstock > 0 ? "  ·  " + outstock + " 行缺货" : "") + (errors > 0 ? "  ·  " + errors + " 行匹配失败" : "") + "  · 不一致字段可编辑，悬浮可查看原因，底部为各列总和"))
+    }, "共 " + previewRows.length + " 行  ·  " + actionable + " 行可写入" + (qtyMis > 0 ? "  ·  " + qtyMis + " 行数量不一致" : "") + (outstock > 0 ? "  ·  " + outstock + " 行缺货" : "") + (errors > 0 ? "  ·  " + errors + " 行匹配失败" : "") + "  · 不一致字段可编辑，悬浮可查看原因，底部为各列总和"))
 
     // 表格
     var tableWrap = el("div", { style: "flex:1;overflow:auto;max-height:60vh" })
@@ -1856,19 +1991,21 @@
       { w: "34px", html: '<input type="checkbox" id="' + PREFIX + 'pdf_select_all" checked style="cursor:pointer">' },
       { w: "80px", text: "店铺" },
       { w: "120px", text: "UPC" },
+      { w: "90px", text: "SKU" },
       { w: "90px", text: "订单关联" },
       { text: "产品名" }
     ]
-    // PDF 流额外两列：数量核对 + PDF Qty（Excel 流无 PDF 源，不展示）
+    // PDF 流额外两列：数量核对 + 供应商 Qty（Excel 流无 PDF 源，不展示；2026-08-19 改列名）
     if (!isExcel) {
-      headers.push({ w: "110px", text: "数量核对" }, { w: "90px", text: "PDF Qty" })
+      headers.push({ w: "110px", text: "数量核对" }, { w: "90px", text: "供应商 Qty" })
     }
     for (var i = 0; i < order.length; i++) {
       headers.push({ w: "110px", text: FIELD_LABELS[order[i]] })
     }
     for (var i = 0; i < headers.length; i++) {
       var th = document.createElement("th")
-      th.style.cssText = "padding:8px 8px;text-align:center;font-weight:600;color:#374151;border-bottom:2px solid #e5e7eb;font-size:11px;white-space:nowrap;vertical-align:middle"
+      // position:sticky 固定表头：滚动表格时列名行始终可见（2026-08-19 用户需求）
+      th.style.cssText = "padding:8px 8px;text-align:center;font-weight:600;color:#374151;border-bottom:2px solid #e5e7eb;font-size:11px;white-space:nowrap;vertical-align:middle;position:sticky;top:0;z-index:3;background:#f3f4f6"
       if (headers[i].w) th.style.width = headers[i].w
       if (headers[i].html) th.innerHTML = headers[i].html
       else th.textContent = headers[i].text
@@ -1938,8 +2075,9 @@
 
     tr.appendChild(td(row.shop || "—", "#374151", "600"))
     tr.appendChild(td(row.upc, "#6b7280", null, "monospace;font-size:11px"))
+    tr.appendChild(td(row.catalog || "—", "#6b7280", null, "font-size:11px"))
     tr.appendChild(td(row.orderRef || "—", "#374151", null, "font-size:11px"))
-    tr.appendChild(td(row.odooLineName || row.catalog || "—", row.error ? "#ef4444" : "#374151"))
+    tr.appendChild(td(row.odooLineName || "—", row.error ? "#ef4444" : "#374151"))
 
     // 数量核对 + PDF Qty 两列（仅 PDF 流；Excel 流无 PDF 源，2026-08-18）
     if (!isExcel) {
@@ -1962,17 +2100,28 @@
         qtyTd.addEventListener("mouseleave", function () {
           if (osTip) { osTip.remove(); osTip = null }
         })
-      } else if (row.qtyMismatch) {
-        qtyTd.innerHTML = '<span style="color:#dc2626;font-weight:600;text-decoration:underline dotted;cursor:help">' + fmtNum(row.qtySum) + ' ≠ ' + fmtNum(row.qtyTarget) + '</span>'
+      } else if (row.qtyMismatch || (row.qtyDetail && row.qtyDetail.length > 1)) {
+        // 数量不一致 或 同 SKU 多条订单关联相加 → 悬浮显示明细（2026-08-19 用户需求）
+        var isMis = row.qtyMismatch
+        qtyTd.innerHTML = isMis
+          ? '<span style="color:#dc2626;font-weight:600;text-decoration:underline dotted;cursor:help">' + fmtNum(row.qtySum) + ' ≠ ' + fmtNum(row.qtyTarget) + '</span>'
+          : '<span style="color:#16a34a;font-weight:600;text-decoration:underline dotted;cursor:help">✓ ' + fmtNum(row.qtyTarget) + '</span>'
         var qTip = null
         qtyTd.addEventListener("mouseenter", function () {
           if (qTip) return
           qTip = el("div", {
-            style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:8px 10px;border-radius:6px;max-width:340px;line-height:1.5;pointer-events:none"
+            style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:8px 10px;border-radius:6px;max-width:340px;line-height:1.6;pointer-events:none"
           })
-          // 两行悬浮：第一行 PDF 原始 Qty，第二行对比结果（2026-08-18 用户需求）
-          qTip.innerHTML = '<div style="font-weight:600;margin-bottom:4px;color:#e5e7eb">PDF Qty = ' + escHtml(fmtNum(row.qtyTarget)) + '</div>' +
-            '<div>' + escHtml(REASONS.qtySum(row.qtySum, row.qtyTarget)) + '</div>'
+          var qhtml = '<div style="font-weight:600;margin-bottom:4px;color:#e5e7eb">供应商 Qty = ' + escHtml(fmtNum(row.qtyTarget)) + '</div>'
+          var dd = row.qtyDetail || []
+          if (dd.length > 1) {
+            qhtml += '<div style="margin-bottom:2px">数量由以下订单关联相加：</div>'
+            for (var di = 0; di < dd.length; di++) {
+              qhtml += '<div>· ' + escHtml(dd[di].ref || "—") + '（SKU ' + escHtml(dd[di].sku || "—") + '）：' + fmtNum(dd[di].qty) + ' 件</div>'
+            }
+          }
+          qhtml += '<div>' + escHtml(isMis ? REASONS.qtySum(row.qtySum, row.qtyTarget) : ("合计 " + fmtNum(row.qtySum) + " = 供应商 Qty " + fmtNum(row.qtyTarget))) + '</div>'
+          qTip.innerHTML = qhtml
           document.body.appendChild(qTip)
           var r = qtyTd.getBoundingClientRect()
           qTip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - qTip.offsetWidth - 8)) + "px"
@@ -2063,11 +2212,27 @@
       var row = ctx.rows[i]
       if (!row._inputs) continue
       for (var k in ctx.cells) {
+        if (k === "pdfQty") continue   // 供应商 Qty 非输入框，下方单独累加
         var inp = row._inputs[k]
         if (!inp) continue
         var n = parseFloat(inp.value)
         if (!isNaN(n)) sums[k] = (sums[k] || 0) + n
       }
+    }
+    // 供应商 Qty 列总和：按 SKU 组去重后累加（同 SKU 多行共享同一 qtyTarget，只算一次）
+    if (ctx.cells.pdfQty) {
+      var pq = 0
+      var seenGroup = {}
+      for (var pi = 0; pi < ctx.rows.length; pi++) {
+        var rt = ctx.rows[pi].qtyTarget
+        var rn = parseFloat(rt)
+        if (isNaN(rn)) continue
+        var gk = (ctx.rows[pi].catalog || "") + "|" + (ctx.rows[pi].upc || "")
+        if (seenGroup[gk]) continue
+        seenGroup[gk] = true
+        pq += rn
+      }
+      sums.pdfQty = pq
     }
     for (var k2 in ctx.cells) {
       ctx.cells[k2].textContent = sums[k2] === undefined ? "0" : String(Math.round(sums[k2] * 1000) / 1000)
@@ -2079,19 +2244,23 @@
     var tfoot = document.createElement("tfoot")
     var tr = document.createElement("tr")
     tr.style.cssText = "background:#f3f4f6"
-    // 前 5 列（勾选/店铺/UPC/订单关联/产品名）合并为标签
+    // 前 6 列（勾选/店铺/UPC/SKU/订单关联/产品名）合并为标签（v1.7.8：加 SKU 列，colSpan 5→6）
     var tdLabel = document.createElement("td")
-    tdLabel.colSpan = 5
+    tdLabel.colSpan = 6
     tdLabel.style.cssText = "padding:6px 8px;font-size:11px;color:#374151;font-weight:600;text-align:center;white-space:nowrap"
     tdLabel.textContent = "总和（全表合计）"
     tr.appendChild(tdLabel)
+    var pdfQtyCell = null
     if (!isExcel) {
       var tdQty = document.createElement("td")
       tdQty.style.cssText = "padding:6px 8px;font-size:11px;color:#9ca3af;text-align:center"
       tr.appendChild(tdQty)
+      // 供应商 Qty 列（qtyTarget 求和，2026-08-19 用户需求）
       var tdPdfQty = document.createElement("td")
-      tdPdfQty.style.cssText = "padding:6px 8px;font-size:11px;color:#9ca3af;text-align:center"
+      tdPdfQty.style.cssText = "padding:6px 8px;font-size:12px;color:#111827;font-weight:600;text-align:center;white-space:nowrap"
+      tdPdfQty.textContent = "0"
       tr.appendChild(tdPdfQty)
+      pdfQtyCell = tdPdfQty
     }
     var cells = {}
     for (var i = 0; i < order.length; i++) {
@@ -2106,6 +2275,7 @@
       }
       tr.appendChild(td)
     }
+    if (pdfQtyCell) cells.pdfQty = pdfQtyCell
     tfoot.appendChild(tr)
     pdfTotalCtx = { rows: previewRows, cells: cells }
     refreshTotal()
