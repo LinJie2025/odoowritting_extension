@@ -22,7 +22,7 @@
 | 第三方库 | `lib/xlsx.full.min.js`、`lib/pdf.min.js`+`lib/pdf.worker.min.js`（pdfjs-dist 3.11.174 UMD，勿升级 4.x） |
 | 打包副本 | `odoowritting_extension/` 子目录 = Chrome「加载已解压」用产物；**改完根目录必须同步过去** |
 | 字段映射 | 集中在 content.js 顶部 `ODOO_FIELDS`（Odoo 字段名，**2026-08-14 用户确认**：包装数量=`product_packaging_qty`、整箱批发价=`box_wholesale_price`、单价=`price_unit`、备注=`remark`、订单关联=`name`）与 `EXCEL_COLS`（Excel 表头名），**改字段只改这两个常量** |
-| 匹配键 | 主匹配（v1.7.2）：PDF `catalog`（CATALOG NO./Catalog#）↔ Excel「SKU」列；Excel 行 SKU 缺失 → PDF `UPC` ↔ Excel「内部参考号」列兜底；Odoo 行 name 中 `\[(\d+)\]` ↔ UPC |
+| 匹配键 | PDF↔Excel（v1.7.2）：PDF `catalog`（CATALOG NO./Catalog#）↔ Excel「SKU」列；Excel 行 SKU 有值只按 SKU 匹配，SKU 缺失才用 PDF `UPC` ↔ Excel「内部参考号」列兜底。**Excel↔Odoo（v1.9.0）：UPC + 包装双重匹配** —— Excel「内部参考号」↔ `order_line/product_id/default_code`；Excel「订单行/包装」件数 ↔ `order_line/product_packaging_id`（qty）；包装对不上或同 UPC 多行无包装 → 报未找到不写回（防错配） |
 | 两条流程 | ✅ **双 Tab（v1.7.0）**：📊 **Excel 导入**（上传「PDF 转换版 Excel」→ `parseConvertedPdfExcel` 解析 → 再传采购订单 Excel → 与 PDF 同逻辑 `applyPdfByMode` → Modal 写回）+ 📄 **PDF 修正**（上传 PDF+Excel → `applyPdfByMode` 匹配修正 → Modal 写回）；两流在 `applyPdfByMode` 汇合，共用 `parseOrderExcel` / `loadOrderLineMap` / `buildPreviewRows` / `buildPdfPreviewModal` / `executePdfUpdate` |
 | 注入条件 | 仅 URL hash 含 `model=purchase.order` 的页面注入按钮 |
 | 价格规则 | 整箱批发价 = PDF Subtotal × 0.9，整数分运算（`calcBoxPrice`） |
@@ -45,5 +45,6 @@
 
 - [x] **Excel 导入入口改造**（v1.7.0 已实现）：吃「PDF 转换版 Excel」，比对逻辑与 PDF 流完全一致（格式 A/B + Coupon + 两步上传，详见 docs/PROJECT.md §6.3）
 - [x] **Excel 入口缺货行不写回价格**（v1.8.0 已实现）：备注「缺货」的行跳过单价/整箱批发价写回，PDF 流不变（详见 docs/PROJECT.md §6.2）
-- [ ] **Chrome 冒烟验证 v1.8.0**：双 Tab 切换、Excel 流（转换版解析/两步上传/预览/缺货行写回）、PDF 流回归
+- [x] **Odoo 匹配键改 UPC+包装**（v1.9.0 已实现）：UPC = `product.default_code`，包装 = `product_packaging_id.qty`，双重匹配防错配（详见 docs/PROJECT.md §6.2）
+- [ ] **Chrome 冒烟验证 v1.9.0**：UPC+包装匹配（同 UPC 多包装精确命中/包装对不上报未找到）、双 Tab 切换、Excel 流、PDF 流回归
 - [ ] `searchPoByName`/`searchPoByRef` 去重合并（低优先，保留无害）
