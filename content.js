@@ -118,6 +118,13 @@
     return nums ? nums[nums.length - 1] : ""
   }
 
+  // 从 PDF/转换版 Excel 的 description 提取包装件数（v2.0 拆分匹配用）：
+  // "Bean Cleansing Oil Jumbo (x42) (Bulk Box) [195ml x 42]" → "42"（只取 (xN) 括号格式，忽略 [195ml x 42]）；提取不到 → ""
+  function extractDescPack(desc) {
+    var m = String(desc || "").match(/\(\s*x\s*(\d+)\s*\)/i)
+    return m ? m[1] : ""
+  }
+
   // 套装单件数量：优先从 PDF PRODUCT DESCRIPTION 提取 "x30"（x 后数字），提取不到降级用 Excel 包装列 pieces
   function parseSetPieces(desc, pack) {
     var m = String(desc || "").match(/x\s*(\d+)/i)
@@ -657,41 +664,83 @@
     return { format: hasHsCode ? "B" : "A", coupon: coupon, rows: rows }
   }
 
-  // ── 通用匹配（v1.7.2）：主匹配 = PDF Catalog（格式B「CATALOG NO.」/格式A「Catalog#」，解析器已统一提取为 catalog 字段）↔ Excel「SKU」列 ──
-  // Excel 行 SKU（catalog）有值 → 只按 SKU 匹配（不参与 UPC 匹配）；SKU 缺失 → 用 PDF UPC ↔ Excel「内部参考号」列兜底
+  // ── 通用匹配（v2.0 重构，2026-08-20）：两级匹配 ──
+  // 第一级 SKU：PDF Catalog（格式B「CATALOG NO.」/格式A「Catalog#」，解析器已统一提取为 catalog 字段）↔ Excel「SKU」列，能匹配上的直接配对（v1.7.2 逻辑不变）
+  // 第二级 UPC（SKU 匹配不上的行）：先整体统计两侧该 UPC 出现次数，任一侧出现多次（同 UPC 多包装/多行）→ 包装拆分匹配：
+  //   PDF 侧 key = UPC + description 的 "(xN)"；Excel 侧 key = UPC + 包装列 "1 box of N pieces" 的 N；
+  //   提取不到包装数字 → key 保持原 UPC 不拼接；两侧唯一 → 直接按 UPC 匹配（原兜底）
+  // 匹配成功后比对处理与 SKU 匹配完全一致；pair.matchKey 供数量核对聚合（SKU 行=Catalog，UPC 行=UPC/拆分键）
   function matchPdfToExcel(pdfRows, excelRows) {
-    var bySku = {}, byUpc = {}
-    for (var i = 0; i < excelRows.length; i++) {
-      var e = excelRows[i]
-      if (e.catalog) {
-        if (!bySku[e.catalog]) bySku[e.catalog] = []
-        bySku[e.catalog].push(e)
-      } else if (e.upc) {
-        // Excel 的 SKU 缺失 → 仅可被 UPC 兜底匹配
-        if (!byUpc[e.upc]) byUpc[e.upc] = []
-        byUpc[e.upc].push(e)
-      }
-    }
     var pairs = []
     var matchedIdx = {}
+
+    // ── 第一级：SKU 匹配（Excel 行 SKU 有值才参与；每个 Excel 行最多配对一次）──
+    var bySku = {}
+    for (var i = 0; i < excelRows.length; i++) {
+      var e = excelRows[i]
+      if (!e.catalog) continue
+      if (!bySku[e.catalog]) bySku[e.catalog] = []
+      bySku[e.catalog].push(e)
+    }
     for (var j = 0; j < pdfRows.length; j++) {
       var p = pdfRows[j]
-      var hits = {}
-      var lc = bySku[p.catalog] || []
-      var lu = byUpc[p.upc] || []
-      for (var a = 0; a < lc.length; a++) hits[lc[a].rowIndex] = lc[a]
-      for (var b = 0; b < lu.length; b++) hits[lu[b].rowIndex] = lu[b]
-      var keys = Object.keys(hits)
-      for (var k = 0; k < keys.length; k++) {
-        var ex = hits[keys[k]]
+      var skuHits = bySku[p.catalog] || []
+      for (var a = 0; a < skuHits.length; a++) {
+        var ex = skuHits[a]
         if (matchedIdx[ex.rowIndex]) continue
         matchedIdx[ex.rowIndex] = true
-        pairs.push({ excel: ex, pdf: p })
+        pairs.push({ excel: ex, pdf: p, matchKey: p.catalog })
       }
     }
-    var outstock = []
+
+    // ── 第二级：UPC 匹配（含包装拆分）──
+    // 整体统计 UPC 出现次数（含已 SKU 匹配的行）：任一侧 >1 → 该 UPC 走包装拆分
+    var upcCntPdf = {}, upcCntExcel = {}
+    for (var c = 0; c < pdfRows.length; c++) {
+      var u = pdfRows[c].upc
+      if (u) upcCntPdf[u] = (upcCntPdf[u] || 0) + 1
+    }
+    for (var d = 0; d < excelRows.length; d++) {
+      var ue = excelRows[d].upc
+      if (ue) upcCntExcel[ue] = (upcCntExcel[ue] || 0) + 1
+    }
+    function needSplit(upc) {
+      return ((upcCntPdf[upc] || 0) > 1 || (upcCntExcel[upc] || 0) > 1)
+    }
+    // Excel 侧：剩余未匹配行，按 UPC 或「UPC+包装」建索引
+    var byUpcKey = {}
     for (var m = 0; m < excelRows.length; m++) {
-      if (!matchedIdx[excelRows[m].rowIndex]) outstock.push(excelRows[m])
+      var er = excelRows[m]
+      if (matchedIdx[er.rowIndex]) continue
+      var ek = er.upc
+      if (needSplit(ek)) {
+        var pkN = extractPackQty(er.pack)
+        if (pkN) ek = ek + "+" + pkN
+      }
+      if (!byUpcKey[ek]) byUpcKey[ek] = []
+      byUpcKey[ek].push(er)
+    }
+    // PDF 侧：所有未配对完的 Excel 行均可继续被同 key 的 PDF 行配对（一个 PDF 行可对应多个订单关联行，v1.7.5 合并核对场景）
+    for (var n = 0; n < pdfRows.length; n++) {
+      var pr = pdfRows[n]
+      var pk = pr.upc
+      if (needSplit(pk)) {
+        var pdN = extractDescPack(pr.description)
+        if (pdN) pk = pk + "+" + pdN
+      }
+      var upcHits = byUpcKey[pk] || []
+      for (var b = 0; b < upcHits.length; b++) {
+        var ex2 = upcHits[b]
+        if (matchedIdx[ex2.rowIndex]) continue
+        matchedIdx[ex2.rowIndex] = true
+        pairs.push({ excel: ex2, pdf: pr, matchKey: pk })
+      }
+    }
+
+    // 未匹配的 Excel 行 → 缺货（v2.0：拆分后仍匹配不上的同样归入缺货）
+    var outstock = []
+    for (var o = 0; o < excelRows.length; o++) {
+      if (!matchedIdx[excelRows[o].rowIndex]) outstock.push(excelRows[o])
     }
     return { pairs: pairs, outstock: outstock }
   }
@@ -713,14 +762,15 @@
     return calcBoxPrice(n)
   }
 
-  // 数量核对：按 SKU（优先）/ UPC（兜底）分组求和 abw交货箱数，标记是否一致
-  // v1.7.5：聚合键与 matchPdfToExcel 匹配键对齐——同一 SKU 拆多个订单关联/多个 UPC（如 A 关联 1 件 + B 关联 18 件 = 19 件）时合并求和 vs PDF Qty 总和
+  // 数量核对：按 matchKey 分组求和 abw交货箱数，标记是否一致
+  // v2.0：聚合键改用 pair.matchKey——SKU 匹配行 = Catalog；UPC 唯一匹配行 = UPC；拆分匹配行 = UPC+包装（不同包装独立核对）
+  // v1.7.5：同一 SKU 拆多个订单关联/多个 UPC（如 A 关联 1 件 + B 关联 18 件 = 19 件）时合并求和 vs PDF Qty 总和
   // v1.5（2026-08-18）：目标 = PDF Qty 原值，不区分格式、不再 ÷pieces（用户确认「abw交货箱数就是Qty列的数」）
   function markQtyMismatch(pairs) {
     var byKey = {}
     for (var i = 0; i < pairs.length; i++) {
-      // SKU 有值按 SKU 聚合（同 SKU 跨 UPC/跨订单关联合并）；SKU 缺失退回 UPC（与匹配兜底一致）
-      var key = pairs[i].pdf.catalog || pairs[i].pdf.upc || ("row-" + i)
+      // SKU 有值按 SKU 聚合（同 SKU 跨 UPC/跨订单关联合并）；UPC 匹配按 UPC 聚合；拆分匹配按 UPC+包装聚合
+      var key = pairs[i].matchKey || pairs[i].pdf.catalog || pairs[i].pdf.upc || ("row-" + i)
       if (!byKey[key]) byKey[key] = []
       byKey[key].push(pairs[i])
     }
@@ -729,14 +779,14 @@
       var target = 0, targetOk = true
       var sum = 0
       var seenPdf = []   // 同一转换版行被多个订单关联命中时，PDF Qty 只累计一次
-      var detailMap = {} // 悬浮明细：按订单关联聚合（同 SKU 多条相加时展示「哪几个订单关联各多少」）
+      var detailMap = {} // 悬浮明细：按订单关联聚合（同 matchKey 多条相加时展示「哪几个订单关联各多少」）
       for (var s = 0; s < list.length; s++) {
         var ex = list[s].excel
         var q = ex.boxQty || 0
         sum += q
         if (q > 0) {
           var ref = ex.orderRef || ex.partnerRef || ""
-          if (!detailMap[ref]) detailMap[ref] = { ref: ref, sku: list[s].pdf.catalog || list[s].pdf.upc || "", qty: 0 }
+          if (!detailMap[ref]) detailMap[ref] = { ref: ref, sku: list[s].matchKey || list[s].pdf.catalog || list[s].pdf.upc || "", qty: 0 }
           detailMap[ref].qty += q
         }
         var pd = list[s].pdf
