@@ -1,7 +1,7 @@
 # Odoo Excel Importer — 项目文档
 
 > 本文件是项目的**权威文档**，与代码同步维护。任何 Agent 接任务前必须先读本文件。
-> 最后更新：2026-08-20（manifest v1.9.0）
+> 最后更新：2026-08-20（manifest v1.10.0）
 
 ---
 
@@ -15,7 +15,7 @@
 | 技术栈 | 纯原生 JS（**ES5 风格：`var` + IIFE + function 声明**），无框架、无构建步骤 |
 | 第三方库 | `lib/xlsx.full.min.js`（SheetJS）、`lib/pdf.min.js` + `lib/pdf.worker.min.js`（pdfjs-dist **3.11.174 UMD 版**，4.x 起无 UMD 故锁定 3.x） |
 | 运行环境 | 任意 Odoo 实例的 `purchase.order` 页面（URL hash 含 `model=purchase.order`） |
-| 版本 | manifest v1.9.0 |
+| 版本 | manifest v1.10.0 |
 
 **核心价值**：人工核对采购数据 → 自动写回 Odoo 的「数量 / 包装数量 / 整箱批发价 / 备注」字段，避免逐行手工录入。
 
@@ -79,7 +79,7 @@ odoowritting_extension/
 | `shop` | 订单行/店铺 | 多条区分 |
 | `qty` | 订单行/数量 | 总件数 |
 | `boxQty` | abw交货箱数 | 交货箱数 → product_packaging_qty |
-| `pack` | 订单行/包装 | 取 "1 box of XX pieces" 的 XX（套装单件数量降级用 + **v1.9 Odoo 包装匹配键**） |
+| `pack` | 订单行/包装 | 取 "1 box of XX pieces" 的 XX（套装单件数量降级用 + v1.9 Odoo 包装匹配键 + **v2.0 拆分匹配键**） |
 | `boxPrice` | 箱规价 | 套装比对列1（不写回） |
 | `boxPrice09` | 0.9箱规价 | 套装比对列 → box_wholesale_price |
 | `total09` | 0.9总价 | 套装比对列（不写回） |
@@ -153,9 +153,13 @@ odoowritting_extension/
 >
 > **全局（单件/套装共用）**：
 > - 按表头有无 `HS CODE` 识别格式：有 HS → PDF 表 `CATALOG NO.` 列；无 HS → PDF 表 `Catalog#` 列（解析器统一提取为 `catalog` 字段）
-> - **匹配（v1.7.2 改）**：主匹配 = PDF `catalog` ↔ Excel「SKU」列（`EXCEL_COLS.catalog`）；**Excel 行 SKU 有值 → 只按 SKU 匹配（即使 UPC 相同也不兜底）**；SKU 缺失的行 → 用 PDF `UPC` ↔ Excel「内部参考号」列（`EXCEL_COLS.upc`）兜底
+> - **匹配（v2.0 重构，2026-08-20 用户需求）**：两级匹配 `matchPdfToExcel`——
+>   - 第一级 SKU：PDF Catalog ↔ Excel「SKU」列（`EXCEL_COLS.catalog`），能匹配上的直接配对（v1.7.2 逻辑不变）
+>   - 第二级 UPC（SKU 匹配不上的行，含 Excel SKU 有值但 catalog 无对应的行）：先**整体统计两侧该 UPC 出现次数**，任一侧出现多次 → **包装拆分匹配**：PDF 侧 key = `UPC+description 的 "(xN)"`（`extractDescPack`，如 "(x42)"→42，忽略 `[195ml x 42]`），Excel 侧 key = `UPC+包装列 pieces`（`extractPackQty`，"1 box of 42 pieces"→42）；提取不到包装数字 → key 保持原 UPC 不拼接。两侧都唯一 → 直接按 UPC 匹配（原兜底）
+>   - 一个 PDF 行可配对多个 Excel 行（SKU 阶段 + UPC 阶段均可，同 SKU/UPC 拆多个订单关联的 v1.7.5 合并核对场景）；每行 Excel 最多配对一次；pair 带 `matchKey`（SKU 行=Catalog，UPC 行=UPC 或拆分键）供数量核对聚合
+>   - 拆分后仍匹配不上的 Excel 行 → 归入 outstock（缺货，用户确认 2026-08-20）；PDF 侧多余行静默忽略
 > - ×0.9 开关：`Coupon=0` → factor=1（不打折）；`Coupon≠0`（负数）→ factor=0.9
-> - 数量核对（v1.7.5）：**按 SKU（优先）/ UPC（兜底）分组**求和 Excel「abw交货箱数」 vs **PDF Qty 总和**（同一转换版行被多个订单关联命中时 PDF Qty 只计一次；SKU 缺失退回按 UPC 分组）。同 SKU 拆多个订单关联/多个 UPC（如 A 关联 1 件 + B 关联 18 件 = 19 件）合并比对，不再各自报错；不一致 modal 提示（不自动扣减）
+> - 数量核对（v2.0）：**按 pair.matchKey 分组**求和 Excel「abw交货箱数」 vs **PDF Qty 总和**（同一转换版行被多个订单关联命中时 PDF Qty 只计一次）。SKU 匹配行按 Catalog 聚合（同 SKU 拆多个订单关联/多个 UPC 合并比对，不再各自报错）；UPC 唯一行按 UPC 聚合；拆分匹配行按 `UPC+包装` 聚合（不同包装独立核对，不合并求和）。不一致 modal 提示（不自动扣减）
 > - **Odoo 行匹配（v1.9 改，2026-08-20 用户需求）**：写回匹配键从「UPC」改为「**UPC + 订单行/包装**」——UPC = Excel「内部参考号」↔ Odoo `order_line/product_id/default_code`（default_code 为空时用 name 正则 `\[(\d+)\]` 兜底）；包装 = Excel「订单行/包装」件数（`extractPackQty` 提取）↔ Odoo `order_line/product_packaging_id`（取其 qty）。**Excel 有包装件数 → 精确匹配（UPC+包装），失败且该 UPC 在 PO 中唯一 → 按 UPC 兜底，多行 → 报「未找到匹配的订单行」不写回（防错配其他包装行）；Excel 无包装件数 → 仅 UPC 唯一时命中，多行同样报未找到**
 > - 缺货备注：① abw交货箱数为空/0；② Excel 有而 PDF 无 → 都备注「缺货」写 remark
 > - **缺货行写回（v1.8.0 改，2026-08-19 用户需求）**：**Excel 入口**缺货行（备注「缺货」）的**单价（price_unit）/ 整箱批发价（box_wholesale_price）不写回 Odoo**（预览仍显示计算值供核对，写回时跳过）；PDF 入口行为不变（缺货行价格照常写回）。实现：`applyPdfByMode` 增加 `source` 参数（'pdf'/'excel'），`applyPdfSingle`/`applyPdfSet` 中缺货行（boxQty 空/0）对应价格字段 `odooField` 置 null
@@ -338,6 +342,7 @@ odoowritting_extension/
 | 11 | ~~Excel 流比对 Odoo 现有值~~ | — | ❌ v1.7.0 移除：Excel 入口改为吃「PDF 转换版 Excel」，与 PDF 流同逻辑 |
 | 12 | Excel 流转换版解析 + 两步上传 | `parseConvertedPdfExcel` 等 | ⚠️ v1.7.0 已实现，样本单测通过，待 Chrome 冒烟验证 |
 | 13 | Odoo 匹配键改 UPC+包装（default_code + packaging qty） | `getOrderLines`/`loadOrderLineMap`/`buildPreviewRows` | ⚠️ v1.9.0 已实现，逻辑单测通过，待 Chrome 冒烟验证 |
+| 14 | PDF↔Excel 匹配重构为两级匹配（SKU 优先 + UPC 包装拆分兜底） | `matchPdfToExcel`/`extractDescPack`/`markQtyMismatch` | ⚠️ v2.0（manifest v1.10.0）已实现，33 断言单测通过，待 Chrome 冒烟验证 |
 
 ---
 
@@ -345,6 +350,6 @@ odoowritting_extension/
 
 1. **只改一个文件**：`content.js`（IIFE 单文件）；字段映射在顶部两个常量对象
 2. **两条在线流程（v1.7.0）**：📊 Excel 导入（上传「PDF 转换版 Excel」→ 上传采购订单 Excel → 与 PDF 同逻辑匹配修正 → Modal 写回）+ 📄 PDF 修正（上传 PDF → 上传 Excel → 匹配修正 → Modal 写回）；两流在 `applyPdfByMode` 汇合，共用 `parseOrderExcel` / `loadOrderLineMap` / `buildPreviewRows` / Modal / `executePdfUpdate`
-3. **UPC+包装是 Odoo 匹配键（v1.9）**：Excel「内部参考号」+「订单行/包装」件数 ↔ Odoo `product.default_code` + `product_packaging_id.qty`（一个 UPC 可能对应多个包装不同的品）；PDF↔Excel 匹配仍是 Catalog/SKU 优先、UPC 兜底；查 PO（=name）优先用「参考号」列、查不到再用「订单关联」列（v1.7.1）
+3. **两级匹配（v2.0）**：PDF/转换版 Excel ↔ 采购单 Excel 先按 Catalog↔SKU 匹配，匹配不上的行走 UPC 匹配（同 UPC 多行用包装拆分：PDF 侧 description "(xN)"、Excel 侧包装列 pieces，拼成 `UPC+N` 精确配对；唯一 UPC 直接匹配）；数量核对按 matchKey（Catalog/UPC/拆分键）分组。**UPC+包装是 Odoo 匹配键（v1.9）**：Excel「内部参考号」+「订单行/包装」件数 ↔ Odoo `product.default_code` + `product_packaging_id.qty`；查 PO（=name）优先用「参考号」列、查不到再用「订单关联」列（v1.7.1）
 4. **无构建、无测试**：改完同步到 `odoowritting_extension/` 子目录后到 Chrome 手动验证
 5. Git 提交必须过 commitlint（husky），格式 `type(scope): subject`
