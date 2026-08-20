@@ -31,7 +31,7 @@
     shop: "订单行/店铺",
     qty: "订单行/数量",              // 总件数（无 HS CODE 时算箱数/箱规价用）
     boxQty: "abw交货箱数",           // 交货箱数 → product_packaging_qty
-    pack: "订单行/包装",             // 取 "1 box of XX pieces" 的 XX
+    pack: "订单行/包装",             // 取 "1 box of XX pieces" 的 XX（套装单件数量降级用 + v1.9 Odoo 包装匹配键）
     boxPrice: "箱规价",              // 箱规价（套装源数据）
     boxPrice09: "0.9箱规价",         // 0.9箱规价 → box_wholesale_price
     total09: "0.9总价",              // 0.9总价（已取消比对，保留列定义）
@@ -105,6 +105,17 @@
   function parsePieces(pack) {
     var m = String(pack || "").match(/of\s+(\d+)\s*pieces?/i)
     return m ? parseInt(m[1], 10) : null
+  }
+
+  // 从「订单行/包装」列提取包装件数（v1.9 用于 Odoo 包装匹配 product_packaging_id 的 qty）
+  // "1 box of 20 pieces" → "20"；"20" → "20"；"1×20"/"20PCS" → "20"；空或无数字 → ""
+  function extractPackQty(pack) {
+    var s = String(pack || "").trim()
+    if (!s) return ""
+    var m = s.match(/of\s+(\d+)\s*pieces?/i)
+    if (m) return m[1]
+    var nums = s.match(/\d+/g)
+    return nums ? nums[nums.length - 1] : ""
   }
 
   // 套装单件数量：优先从 PDF PRODUCT DESCRIPTION 提取 "x30"（x 后数字），提取不到降级用 Excel 包装列 pieces
@@ -190,18 +201,48 @@
     return { id: result[0].id, orderLineIds: result[0].order_line }
   }
 
+  // 批量取订单行（v1.9 匹配键改造：UPC = product.default_code，包装 = product.packaging 的 qty）
+  // 一个 UPC 可能对应多个包装不同的品，需 UPC + 包装双重匹配（用户 2026-08-20 需求）
   async function getOrderLines(ids) {
     var result = await rpcCall("/web/dataset/call_kw/purchase.order.line/search_read", {
       model: "purchase.order.line", method: "search_read",
       args: [], kwargs: {
         domain: [["id", "in", ids]],
-        fields: ["id", "name", "price_unit", "box_wholesale_price", "remark", "product_packaging_qty"]
+        fields: ["id", "name", "price_unit", "box_wholesale_price", "remark", "product_packaging_qty", "product_id", "product_packaging_id"]
       }
     })
+    var productIds = [], packIds = []
+    for (var i = 0; i < result.length; i++) {
+      if (result[i].product_id && result[i].product_id.length) productIds.push(result[i].product_id[0])
+      if (result[i].product_packaging_id && result[i].product_packaging_id.length) packIds.push(result[i].product_packaging_id[0])
+    }
+    var codeMap = {}, packMap = {}
+    if (productIds.length) {
+      var prods = await rpcCall("/web/dataset/call_kw/product.product/search_read", {
+        model: "product.product", method: "search_read",
+        args: [], kwargs: { domain: [["id", "in", productIds]], fields: ["id", "default_code"] }
+      })
+      for (var p = 0; p < prods.length; p++) codeMap[prods[p].id] = prods[p].default_code || ""
+    }
+    if (packIds.length) {
+      var packs = await rpcCall("/web/dataset/call_kw/product.packaging/search_read", {
+        model: "product.packaging", method: "search_read",
+        args: [], kwargs: { domain: [["id", "in", packIds]], fields: ["id", "name", "qty"] }
+      })
+      for (var q = 0; q < packs.length; q++) packMap[packs[q].id] = { qty: packs[q].qty, name: packs[q].name || "" }
+    }
     return result.map(function (r) {
-      var m = r.name.match(/\[(\d+)\]/)
+      // UPC = product.default_code（用户指定字段）；为空时用 name 中 [数字] 兜底（旧数据兼容）
+      var code = (r.product_id && r.product_id.length) ? (codeMap[r.product_id[0]] || "") : ""
+      if (!code) {
+        var m = r.name.match(/\[(\d+)\]/)
+        code = m ? m[1] : ""
+      }
+      var pk = (r.product_packaging_id && r.product_packaging_id.length) ? packMap[r.product_packaging_id[0]] : null
       return {
-        id: r.id, name: r.name, upc: m ? m[1] : "",
+        id: r.id, name: r.name, defaultCode: code,
+        packQty: (pk && pk.qty !== null && pk.qty !== undefined && pk.qty !== "") ? String(pk.qty) : "",
+        packName: pk ? pk.name : "",
         price_unit: r.price_unit, box_wholesale_price: r.box_wholesale_price,
         packaging_qty: r.product_packaging_qty,
         remark: r.remark || ""
@@ -753,6 +794,7 @@
       fields.push(unitField)
       changes.push({
         kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef, partnerRef: ex.partnerRef,
+        packQty: extractPackQty(ex.pack),
         qtyTarget: pair.qtyTarget, qtySum: pair.qtySum, qtyMismatch: pair.qtyMismatch, qtyDetail: pair.qtyDetail,
         fields: fields
       })
@@ -762,6 +804,7 @@
       var er = m.outstock[q]
       changes.push({
         kind: "outstock", upc: er.upc, catalog: er.catalog, shop: er.shop, orderRef: er.orderRef, partnerRef: er.partnerRef,
+        packQty: extractPackQty(er.pack),
         qtyTarget: null, qtySum: null, qtyMismatch: false,
         fields: [{ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock }]
       })
@@ -855,6 +898,7 @@
 
       changes.push({
         kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef, partnerRef: ex.partnerRef,
+        packQty: extractPackQty(ex.pack),
         qtyTarget: pair.qtyTarget, qtySum: pair.qtySum, qtyMismatch: pair.qtyMismatch, qtyDetail: pair.qtyDetail,
         fields: fields
       })
@@ -864,6 +908,7 @@
       var er = m.outstock[q]
       changes.push({
         kind: "outstock", upc: er.upc, catalog: er.catalog, shop: er.shop, orderRef: er.orderRef, partnerRef: er.partnerRef,
+        packQty: extractPackQty(er.pack),
         qtyTarget: null, qtySum: null, qtyMismatch: false,
         fields: [{ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock }]
       })
@@ -1805,10 +1850,11 @@
     }
   }
 
-  // 查 PO → 订单行，构建 lineMap（key = ref|upc，两流共用）
+  // 查 PO → 订单行，构建 lineMap（v1.9：key = ref|defaultCode 兜底 + ref|defaultCode|包装件数 精确）
   // 2026-08-19：每行优先用「参考号」查 PO（两者都查 Odoo name 字段），查不到再用「订单关联」；命中行按两个键都注册
+  // 返回 { map: 行查找表, cnt: ref|defaultCode 出现次数 }——包装匹配失败时按 cnt 判断是否唯一可兜底（避免错配同 UPC 其他包装行）
   async function loadOrderLineMap(refPairs) {
-    var lineMap = {}
+    var lineMap = {}, cnt = {}
     for (var r = 0; r < refPairs.length; r++) {
       var orderRef = refPairs[r].orderRef, partnerRef = refPairs[r].partnerRef
       try {
@@ -1817,17 +1863,24 @@
         if (!po && orderRef) po = await searchPoByRef(orderRef) // 查不到再匹配订单关联
         if (po && po.orderLineIds.length) {
           var lines = await getOrderLines(po.orderLineIds)
+          var refs = []
+          if (orderRef) refs.push(orderRef)
+          if (partnerRef && partnerRef !== orderRef) refs.push(partnerRef)
           for (var j = 0; j < lines.length; j++) {
-            if (!lines[j].upc) continue
-            if (orderRef) lineMap[orderRef + "|" + lines[j].upc] = lines[j]
-            if (partnerRef && partnerRef !== orderRef) lineMap[partnerRef + "|" + lines[j].upc] = lines[j]
+            if (!lines[j].defaultCode) continue
+            for (var x = 0; x < refs.length; x++) {
+              var k0 = refs[x] + "|" + lines[j].defaultCode
+              cnt[k0] = (cnt[k0] || 0) + 1
+              lineMap[k0] = lines[j]
+              if (lines[j].packQty !== "") lineMap[k0 + "|" + lines[j].packQty] = lines[j]
+            }
           }
         }
       } catch (e) {
         console.error("[Odoo Excel Importer] 查询失败 " + (partnerRef || orderRef), e)
       }
     }
-    return lineMap
+    return { map: lineMap, cnt: cnt }
   }
 
   // 构建 PDF 区预览行（含 Odoo 订单行匹配；参考号/订单关联去重成 refPairs）
@@ -1841,21 +1894,38 @@
       seen[k] = true
       refPairs.push({ orderRef: c.orderRef || "", partnerRef: c.partnerRef || "" })
     }
-    var lineMap = await loadOrderLineMap(refPairs)
-    return buildPreviewRows(changes, lineMap)
+    var lineData = await loadOrderLineMap(refPairs)
+    return buildPreviewRows(changes, lineData)
   }
 
-  // changes + lineMap → 预览行（PDF/Excel 两流共用；lineMap 已查好时直接走此函数）
-  function buildPreviewRows(changes, lineMap) {
+  // changes + lineData({map,cnt}) → 预览行（PDF/Excel 两流共用；lineData 已查好时直接走此函数）
+  // v1.9 匹配规则：UPC = Excel「内部参考号」↔ Odoo product.default_code；包装 = Excel「订单行/包装」件数 ↔ Odoo product_packaging.qty
+  // - Excel 有包装件数 → 精确匹配 UPC+包装；失败且该 UPC 在 PO 中唯一 → 按 UPC 兜底；多行 → 报未找到（不降级到其他包装行，避免写错行）
+  // - Excel 无包装件数 → 仅当该 UPC 在 PO 中唯一时按 UPC 命中；多行 → 报未找到
+  function buildPreviewRows(changes, lineData) {
+    var lineMap = lineData.map, cnt = lineData.cnt || {}
     var previewRows = []
     for (var k = 0; k < changes.length; k++) {
       var c = changes[k]
-      var line = (c.orderRef && lineMap[c.orderRef + "|" + c.upc]) ||
-                 (c.partnerRef && lineMap[c.partnerRef + "|" + c.upc]) || null
+      var line = null
+      var refs = []
+      if (c.orderRef) refs.push(c.orderRef)
+      if (c.partnerRef && c.partnerRef !== c.orderRef) refs.push(c.partnerRef)
+      for (var rr = 0; rr < refs.length && !line; rr++) {
+        var ref = refs[rr]
+        var k0 = ref + "|" + c.upc
+        if (c.packQty) {
+          line = lineMap[ref + "|" + c.upc + "|" + c.packQty] || null
+          if (line) break
+        }
+        // 精确包装匹配不到（或 Excel 无包装件数）：仅当该 UPC 在 PO 中唯一时按 UPC 兜底
+        if (cnt[k0] === 1) { line = lineMap[k0] || null; break }
+        if (cnt[k0] > 1) break
+      }
       var hasChanged = false
       for (var f = 0; f < c.fields.length; f++) { if (c.fields[f].changed) hasChanged = true }
       // v1.7.7：数据一致（白底无标记）的行也可勾选写入；仅「未找到匹配的订单行」不可勾选
-      var lineErr = line ? null : "未找到匹配的订单行"
+      var lineErr = line ? null : "未找到匹配的订单行（UPC " + (c.upc || "—") + (c.packQty ? " / 包装 " + c.packQty + " 件" : "") + "）"
       previewRows.push({
         idx: k,
         upc: c.upc, catalog: c.catalog, shop: c.shop, orderRef: c.orderRef || c.partnerRef || "",
