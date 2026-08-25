@@ -283,8 +283,9 @@ odoowritting_extension/
 - **Excel 列（`PRODUCT_EXCEL_COLS`，表头第 1 行按名定位 + 正则容错）**：`UPC`（12/13 位数字，按字符串 trim 处理）| `品牌` | `中文简称`（样本实测含 `\n`，解析时转空格）
 - **Odoo 字段（`PRODUCT_ODOO_FIELDS`，用户确认均为 Char）**：`default_code`（定位键）| `brand`（品牌）| `name`（中文简称）
 - **流程**：上传商品库 Excel（`makeDropZone` 复用）→ `parseProductExcel` → `loadProductByUpc`（search_read `product.product`，domain `default_code in [...]`，UPC 去重后 500/批分块）→ `buildProductPreviewRows` → `buildProductPreviewModal`（UPC + 中文简称/品牌「旧→新」对照 + 勾选）→ `executeProductUpdate`（批量 write `{name, brand}`）
-- **行状态**：`ok`（✅ 待更新，UPC 匹配到唯一产品，**默认全勾选**）/ `notfound`（⚠️ 未匹配，UPC 无对应产品，注明原因）/ `dup`（🔁 UPC 匹配到多个产品，注明原因需人工）；**不做新旧比对**（用户 2026-08-21 确认）
-- **写回**：Excel 为权威源，`{name, brand}` 按 Excel 值**直接写入（空值也照写，无空值保护）**；仅勾选行写回；日志/toast 与双流共用
+- **行状态**：`ok`（✅ 将更新，**与 Odoo 原值比对有差异**）/ `same`（ℹ️ 值相同，**与 Odoo 原值比对一致，仍照写**）/ `notfound`（⚠️ 未匹配，UPC 无对应产品，注明原因）/ `dup`（🔁 UPC 匹配到多个产品，注明原因需人工）；**读取 Odoo 原 name/brand 与 Excel 比对展示**（用户 2026-08-21 要求），**写回不做比对**（匹配到唯一产品即写，空值也照写）
+- **写回**：Excel 为权威源，`{name, brand}` 按 Excel 值**直接写入（空值也照写，无空值保护）**；仅勾选行写回；日志/toast 与双流共用；日志含 old/new 旧→新对照
+- **⚠️ Odoo 多语言翻译（2026-08-21 实测修复）**：`product.product.name` 是**多语言翻译字段**（translate），zh_CN 用户界面显示的是**简体中文翻译值**而非 source。扩展读/写 name **必须带 `context.lang="zh_CN"`**：读 → 预览旧值=界面实际显示值；写 → 覆盖中文翻译（source 已=Excel 值无需动）。不带 lang 会导致「数据库 source=Excel 但中文界面仍显示旧翻译」的假象。`brand` 无 translate 不受影响。**修复后需重跑一次全量更新覆盖 79 条已写入产品的中文翻译**
 - **样本实测（2026-08-21，openpyxl）**：`极牛产品名称-KVIVA(1).xlsx` → Sheet1 142 行（1 表头 + 141 数据）、3 列、无合并单元格、UPC 12/13 位混存（如 8809640734526 / 880933516775）、中文简称含换行
 
 ---
