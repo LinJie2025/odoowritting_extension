@@ -41,6 +41,20 @@
     partnerRef: "参考号"             // 参考号（2026-08-19 新增：查 PO 优先用它，查不到再用订单关联；两者都匹配 Odoo name 字段）
   }
 
+  // 商品库更新（v1.11.0 新增）：商品库 Excel 表头列名（表头第 1 行，按名定位）
+  var PRODUCT_EXCEL_COLS = {
+    upc: "UPC",           // 定位键（匹配 product.default_code）
+    brand: "品牌",         // → product.brand（Char，用户 2026-08-21 确认）
+    shortName: "中文简称"  // → product.name（Char，用户 2026-08-21 确认）
+  }
+
+  // 商品库更新：Odoo product.product（产品变体）字段映射（用户 2026-08-21 确认）
+  var PRODUCT_ODOO_FIELDS = {
+    upc: "default_code",  // 定位键
+    brand: "brand",       // 品牌（Char，直接写字符串）
+    shortName: "name"     // 商品名称（中文）（Char）
+  }
+
   // ═══════════════════════════════════════════
   //  工具函数
   // ═══════════════════════════════════════════
@@ -172,6 +186,16 @@
 
   function isPurchaseOrderPage() {
     return window.location.hash.includes("model=purchase.order")
+  }
+
+  // 商品库更新页面（v1.11.0）：产品变体列表/表单（产品 → 产品变体）
+  function isProductPage() {
+    return window.location.hash.includes("model=product.product")
+  }
+
+  // 扩展可注入页面（采购订单 或 产品变体）
+  function isAnyPage() {
+    return isPurchaseOrderPage() || isProductPage()
   }
 
   // ═══════════════════════════════════════════
@@ -1013,7 +1037,7 @@
   // ═══════════════════════════════════════════
   var appState = {
     cardOpen: false,
-    activeTab: "excel"      // 'excel' | 'pdf'（双 Tab，2026-08-18 恢复）
+    activeTab: isProductPage() ? "product" : "excel"   // 'excel' | 'pdf' | 'product'（商品库更新，v1.11.0；产品页默认商品库 Tab）
   }
 
   // PDF 修正入口模式（单件 / 套装，处理逻辑区分）
@@ -1046,6 +1070,14 @@
     excelFileName: null,
     changes: null,       // applyPdfByMode 结果（与 PDF 流同一逻辑）
     error: null
+  }
+
+  // 商品库更新区流程状态（v1.11.0 新增：上传商品库 Excel → 按 UPC 查 product.product → 预览 → 写回 name/brand）
+  var productState = {
+    rows: null,          // 解析出的 Excel 行 [{rowIndex, upc, brand, shortName}]
+    fileName: null,
+    previewRows: null,   // 预览行（含 Odoo 匹配结果与状态）
+    error: null          // 当前步骤错误信息
   }
 
   // ═══════════════════════════════════════════
@@ -1150,7 +1182,7 @@
       btn.style.cursor = "grab"
       btn.textContent = "📥"
       var file = e.dataTransfer.files[0]
-      if (file) showToast("请在卡片内选择入口上传文件（📊 Excel 导入 / 📄 PDF 修正）", "info")
+      if (file) showToast("请在卡片内选择入口上传文件（📊 Excel 导入 / 📄 PDF 修正 / 🏷 商品库更新）", "info")
     })
 
     return btn
@@ -1265,9 +1297,12 @@
 
   function renderCardContent() {
     var frag = document.createDocumentFragment()
-    var isExcelTab = appState.activeTab === "excel"
-    var titleText = isExcelTab ? "Excel 导入" : "PDF 修正"
-    if (isExcelTab ? excelState.mode : pdfState.mode) {
+    var tab = appState.activeTab
+    var isExcelTab = tab === "excel"
+    var isProductTab = tab === "product"
+    // 标题：商品库更新 / Excel 导入 / PDF 修正（含当前入口徽章，商品库无入口概念）
+    var titleText = isProductTab ? "商品库更新" : (isExcelTab ? "Excel 导入" : "PDF 修正")
+    if (!isProductTab && (isExcelTab ? excelState.mode : pdfState.mode)) {
       var m = PDF_MODES[isExcelTab ? excelState.mode : pdfState.mode]
       titleText += " · " + m.label
     }
@@ -1277,7 +1312,7 @@
       style: "display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid #f3f4f6;user-select:none"
     }, [
       el("div", { style: "display:flex;align-items:center;gap:8px" }, [
-        el("span", { style: "font-size:11px;color:#6b7280;background:#f3f4f6;padding:2px 6px;border-radius:4px" }, "采购结果"),
+        el("span", { style: "font-size:11px;color:#6b7280;background:#f3f4f6;padding:2px 6px;border-radius:4px" }, isProductTab ? "商品库" : "采购结果"),
         el("span", { style: "font-size:15px;font-weight:600;color:#111827" }, titleText)
       ]),
       el("button", {
@@ -1286,11 +1321,12 @@
       }, "✕")
     ]))
 
-    // Tab 栏：📊 Excel 导入 / 📄 PDF 修正
+    // Tab 栏：📊 Excel 导入 / 📄 PDF 修正 / 🏷 商品库更新（v1.11.0）
     frag.appendChild(renderTabSwitch())
 
     // 内容区（按 Tab 路由）
     if (isExcelTab) frag.appendChild(renderExcelZone())
+    else if (isProductTab) frag.appendChild(renderProductZone())
     else frag.appendChild(renderPdfZone())
 
     // 日志区 (有日志才显示)
@@ -1316,7 +1352,8 @@
     var bar = el("div", { style: "display:flex;padding:10px 16px 0;gap:8px" })
     var tabs = [
       { id: "excel", label: "📊 Excel 导入" },
-      { id: "pdf", label: "📄 PDF 修正" }
+      { id: "pdf", label: "📄 PDF 修正" },
+      { id: "product", label: "🏷 商品库更新" }
     ]
     for (var i = 0; i < tabs.length; i++) {
       (function (t) {
@@ -1633,6 +1670,442 @@
       wrap.appendChild(btnRow)
     }
     return wrap
+  }
+
+  // ═══════════════════════════════════════════
+  //  3d. 商品库更新区（v1.11.0 新增：上传商品库 Excel → 按 UPC 查 product.product → 预览 → 写回 name/brand）
+  // ═══════════════════════════════════════════
+  function renderProductZone() {
+    var wrap = el("div", { style: "margin:12px 16px;display:flex;flex-direction:column;gap:10px" })
+
+    // 常驻错误提示
+    if (productState.error) {
+      wrap.appendChild(el("div", {
+        style: "font-size:12px;color:#dc2626;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:8px 10px;line-height:1.5"
+      }, "⚠️ " + productState.error))
+    }
+
+    // 解析成功提示（含匹配统计：有差异 / 值相同 / 未匹配 / 重复；缺 UPC 跳过数单独提示）
+    if (productState.previewRows) {
+      var ok = productState.previewRows.filter(function (r) { return r.status === "ok" }).length
+      var same = productState.previewRows.filter(function (r) { return r.status === "same" }).length
+      var notfound = productState.previewRows.filter(function (r) { return r.status === "notfound" }).length
+      var dup = productState.previewRows.filter(function (r) { return r.status === "dup" }).length
+      var skipTip = (productState.rows && productState.rows.skippedCount) ? "，" + productState.rows.skippedCount + " 行缺 UPC 已跳过" : ""
+      wrap.appendChild(el("div", {
+        style: "font-size:12px;color:#059669;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px 10px;line-height:1.5"
+      }, "✅ 已解析 " + (productState.fileName || "") + "（" + productState.previewRows.length + " 行）：" + ok + " 行有差异将更新" + (same ? "，" + same + " 行值相同" : "") + (notfound ? "，" + notfound + " 行未匹配到产品" : "") + (dup ? "，" + dup + " 行 UPC 重复" : "") + skipTip))
+    } else if (productState.rows) {
+      wrap.appendChild(el("div", {
+        style: "font-size:12px;color:#059669;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px 10px"
+      }, "✅ 商品库已解析：" + (productState.fileName || "") + "（" + productState.rows.length + " 行），正在查询 Odoo 产品..."))
+    }
+
+    if (!productState.rows) {
+      // 步骤1：上传商品库 Excel
+      wrap.appendChild(makeDropZone("点击上传或拖拽商品库 Excel", "需含 UPC / 品牌 / 中文简称 三列（表头第 1 行）", "🏷", "excel", function (file) { processProductFile(file) }))
+    } else if (productState.previewRows) {
+      // 步骤2：预览 + 重置
+      var btnRow = el("div", { style: "display:flex;gap:8px" }, [
+        el("button", {
+          onclick: function () { previewProductChanges() },
+          style: "flex:1;padding:10px;border:none;border-radius:8px;background:#7c3aed;color:#fff;font-size:13px;font-weight:600;cursor:pointer"
+        }, "👁 预览修改"),
+        el("button", {
+          onclick: function () { resetProductState() },
+          style: "padding:10px 14px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#6b7280;font-size:13px;cursor:pointer"
+        }, "重置")
+      ])
+      wrap.appendChild(btnRow)
+    } else {
+      // 查询中
+      wrap.appendChild(el("div", { style: "text-align:center;padding:16px;font-size:12px;color:#6b7280" }, "⏳ 正在按 UPC 查询 Odoo 产品..."))
+    }
+    return wrap
+  }
+
+  // 商品库 Excel 解析：表头第 1 行，按列名定位 UPC/品牌/中文简称（正则容错列名变体）
+  function parseProductExcel(data) {
+    var wb = XLSX.read(data, { type: "array" })
+    var ws = wb.Sheets[wb.SheetNames[0]]
+    var rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true })
+    if (!rows.length) throw new Error("Excel 为空或格式不正确")
+    var header = rows[0].map(function (h) { return String(h || "").trim() })
+    function colIdxFuzzy(keywords) {
+      for (var j = 0; j < header.length; j++) {
+        var h = header[j]
+        if (!h) continue
+        for (var k = 0; k < keywords.length; k++) {
+          if (h.indexOf(keywords[k]) !== -1) return j
+        }
+      }
+      return -1
+    }
+    function cell(row, i) {
+      if (i < 0) return ""
+      var v = row[i]
+      return (v === undefined || v === null) ? "" : v
+    }
+    var idx = {
+      upc: colIdxFuzzy(["UPC", "EAN", "条码", "Barcode"]),
+      brand: colIdxFuzzy(["品牌", "Brand"]),
+      shortName: colIdxFuzzy(["中文简称", "简称", "中文名", "名称"])
+    }
+    if (idx.upc < 0) throw new Error("未找到 UPC 列（表头需含「UPC」）")
+    if (idx.brand < 0) throw new Error("未找到品牌列（表头需含「品牌」）")
+    if (idx.shortName < 0) throw new Error("未找到中文简称列（表头需含「中文简称」）")
+
+    var result = []
+    result.skippedCount = 0   // 缺 UPC 被跳过的行数（无法定位产品，主动告知用户）
+    for (var i = 1; i < rows.length; i++) {
+      var row = rows[i]
+      if (!row || !row.length) continue
+      var upc = String(cell(row, idx.upc)).trim()
+      if (!upc) { result.skippedCount++; continue }
+      result.push({
+        rowIndex: i,
+        upc: upc,
+        brand: String(cell(row, idx.brand)).trim(),
+        // 中文简称样本实测含换行符，写入前转空格（name 单行显示）
+        shortName: String(cell(row, idx.shortName)).replace(/\n+/g, " ").trim()
+      })
+    }
+    if (!result.length) throw new Error("Excel 中没有有效数据（UPC 列为空）")
+    return result
+  }
+
+  // 按 UPC（=default_code）批量查 product.product；一个 UPC 可能对应多个产品 → 返回数组
+  // context.lang=zh_CN：Odoo name 字段是多语言翻译字段，带 lang 读中文翻译值（=用户界面实际显示的值），比对/预览才准（2026-08-21 修复）
+  async function loadProductByUpc(upcList) {
+    var result = await rpcCall("/web/dataset/call_kw/product.product/search_read", {
+      model: "product.product", method: "search_read",
+      args: [], kwargs: {
+        domain: [["default_code", "in", upcList]],
+        fields: ["id", "name", "default_code", PRODUCT_ODOO_FIELDS.brand],
+        context: { lang: "zh_CN" }
+      }
+    })
+    var map = {}
+    for (var i = 0; i < result.length; i++) {
+      var r = result[i]
+      var code = String(r.default_code || "").trim()
+      if (!code) continue
+      if (!map[code]) map[code] = []
+      map[code].push({ id: r.id, name: r.name || "", brand: r[PRODUCT_ODOO_FIELDS.brand] || "", defaultCode: code })
+    }
+    return map
+  }
+
+  // 合并 Excel 行与 Odoo 匹配结果 → 预览行（状态：ok 将更新 / same 值相同 / notfound 未匹配 / dup UPC 重复）
+  // 读取 Odoo 原 name/brand 与 Excel 比对展示（用户 2026-08-21 要求）；写回不做比对：匹配到唯一产品 → 直接更新（空值也照写）
+  function buildProductPreviewRows(rows, map) {
+    return rows.map(function (r) {
+      var list = map[r.upc] || null
+      if (!list || !list.length) {
+        return { upc: r.upc, brand: r.brand, shortName: r.shortName, status: "notfound", error: "UPC 未匹配到产品（default_code 无对应）", checked: false, hasAction: false }
+      }
+      if (list.length > 1) {
+        return { upc: r.upc, brand: r.brand, shortName: r.shortName, status: "dup", error: "UPC 匹配到 " + list.length + " 个产品，无法确定目标，需人工处理", checked: false, hasAction: false }
+      }
+      var p = list[0]
+      // 与 Odoo 原值比对（仅展示用途，写回不受影响）
+      var nameSame = (r.shortName === (p.name || ""))
+      var brandSame = (r.brand === (p.brand || ""))
+      var isSame = nameSame && brandSame
+      return {
+        upc: r.upc,
+        oldName: p.name || "", newName: r.shortName,
+        oldBrand: p.brand || "", newBrand: r.brand,
+        nameSame: nameSame, brandSame: brandSame,
+        odooProductId: p.id,
+        status: isSame ? "same" : "ok",
+        error: "",
+        checked: true,   // 匹配到即默认勾选（值相同也照写，用户确认「匹配到就更新」）
+        hasAction: true
+      }
+    })
+  }
+
+  async function processProductFile(file) {
+    try {
+      productState.error = null
+      var data = await file.arrayBuffer()
+      var rows = parseProductExcel(data)
+      productState.rows = rows
+      productState.fileName = file.name
+      productState.previewRows = null
+      refreshCard()
+      updateLoadingOverlay("正在按 UPC 查询 Odoo 产品...")
+      // 去重 UPC 后分块查询（Odoo domain in 一次不宜过大）
+      var upcSet = {}
+      for (var i = 0; i < rows.length; i++) upcSet[rows[i].upc] = true
+      var upcs = Object.keys(upcSet)
+      var map = {}
+      for (var s = 0; s < upcs.length; s += 500) {
+        var slice = upcs.slice(s, s + 500)
+        var part = await loadProductByUpc(slice)
+        for (var k in part) map[k] = part[k]
+      }
+      productState.previewRows = buildProductPreviewRows(rows, map)
+      updateLoadingOverlay(null)
+      refreshCard()
+      var ok = productState.previewRows.filter(function (r) { return r.status === "ok" }).length
+      var same = productState.previewRows.filter(function (r) { return r.status === "same" }).length
+      var notfound = productState.previewRows.filter(function (r) { return r.status === "notfound" }).length
+      var dup = productState.previewRows.filter(function (r) { return r.status === "dup" }).length
+      var skipTip = rows.skippedCount ? "，" + rows.skippedCount + " 行缺 UPC 已跳过" : ""
+      showToast("查询完成：" + ok + " 行有差异" + (same ? "，" + same + " 行值相同" : "") + (notfound ? "，" + notfound + " 行未匹配" : "") + (dup ? "，" + dup + " 行 UPC 重复" : "") + skipTip, (notfound + dup) > 0 ? "info" : "success")
+    } catch (err) {
+      productState.error = err.message || String(err)
+      updateLoadingOverlay(null)
+      refreshCard()
+      showToast("解析失败: " + productState.error, "error")
+      console.error("[Odoo Product]", err)
+    }
+  }
+
+  function previewProductChanges() {
+    if (!productState.previewRows) return
+    buildProductPreviewModal(productState.previewRows, productState.fileName)
+  }
+
+  function resetProductState() {
+    productState.rows = null
+    productState.fileName = null
+    productState.previewRows = null
+    productState.error = null
+    refreshCard()
+  }
+
+  // 预览 Modal：UPC + 中文简称/品牌 旧值→新值 对照 + 勾选（复用现有 Modal 基础设施）
+  function buildProductPreviewModal(previewRows, fileName) {
+    removeModals()
+    var overlay = el("div", {
+      id: PREFIX + "modal_overlay",
+      style: "position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:100010;display:flex;align-items:center;justify-content:center"
+    })
+    overlay.addEventListener("click", function (e) { if (e.target === overlay) removeModals() })
+
+    var modal = el("div", {
+      style: "background:#fff;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.2);width:92vw;max-width:1100px;max-height:86vh;display:flex;flex-direction:column;overflow:hidden"
+    })
+    overlay.appendChild(modal)
+
+    // Header
+    modal.appendChild(el("div", {
+      style: "display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid #e5e7eb"
+    }, [
+      el("h2", { style: "margin:0;font-size:16px;color:#111827;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" }, "🏷 商品库更新 · " + (fileName || "预览")),
+      el("button", {
+        onclick: function () { removeModals() },
+        style: "width:28px;height:28px;border:1px solid #e5e7eb;border-radius:6px;background:#fff;color:#6b7280;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center"
+      }, "✕")
+    ]))
+
+    // 统计栏（含「值相同」行——已与 Odoo 原值比对一致，仍会照写）
+    var ok = previewRows.filter(function (r) { return r.status === "ok" }).length
+    var same = previewRows.filter(function (r) { return r.status === "same" }).length
+    var notfound = previewRows.filter(function (r) { return r.status === "notfound" }).length
+    var dup = previewRows.filter(function (r) { return r.status === "dup" }).length
+    modal.appendChild(el("div", {
+      style: "padding:10px 20px;background:#f0f9ff;font-size:12px;color:#1e40af"
+    }, "共 " + previewRows.length + " 行  ·  " + ok + " 行有差异将更新" + (same > 0 ? "  ·  " + same + " 行与 Odoo 值相同" : "") + (notfound > 0 ? "  ·  " + notfound + " 行未匹配到产品" : "") + (dup > 0 ? "  ·  " + dup + " 行 UPC 重复" : "") + "  ·  仅勾选行会写入 Odoo"))
+
+    // 表格
+    var tableWrap = el("div", { style: "flex:1;overflow:auto;max-height:58vh" })
+    tableWrap.appendChild(renderProductPreviewTable(previewRows))
+    modal.appendChild(tableWrap)
+
+    // Footer
+    modal.appendChild(el("div", {
+      style: "display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-top:1px solid #e5e7eb"
+    }, [
+      el("span", { style: "font-size:12px;color:#6b7280" }, "未匹配到产品或 UPC 重复的行不可勾选"),
+      el("button", {
+        id: PREFIX + "product_confirm_btn",
+        onclick: function () { executeProductUpdate(previewRows, fileName) },
+        style: "padding:8px 20px;border:none;border-radius:8px;background:#7c3aed;color:#fff;font-size:13px;font-weight:600;cursor:pointer"
+      }, "✅ 确认写入 Odoo")
+    ]))
+
+    document.body.appendChild(overlay)
+    currentModalOverlay = overlay
+  }
+
+  function renderProductPreviewTable(previewRows) {
+    var table = el("table", { style: "width:100%;border-collapse:collapse;font-size:12px" })
+    var hoverStyle = document.createElement("style")
+    hoverStyle.textContent = "#" + PREFIX + "modal_overlay tbody tr:hover td{background:#f5f3ff!important}"
+    table.appendChild(hoverStyle)
+    var thead = document.createElement("thead")
+    var tr = document.createElement("tr")
+    tr.style.cssText = "background:#f3f4f6"
+    var headers = [
+      { w: "36px", html: '<input type="checkbox" id="' + PREFIX + 'product_select_all" checked style="cursor:pointer">' },
+      { w: "130px", text: "UPC" },
+      { text: "中文简称（旧 → 新）" },
+      { text: "品牌（旧 → 新）" },
+      { w: "130px", text: "状态" }
+    ]
+    for (var i = 0; i < headers.length; i++) {
+      var th = document.createElement("th")
+      th.style.cssText = "padding:8px 8px;text-align:center;font-weight:600;color:#374151;border-bottom:2px solid #e5e7eb;font-size:11px;white-space:nowrap;vertical-align:middle;position:sticky;top:0;z-index:3;background:#f3f4f6"
+      if (headers[i].w) th.style.width = headers[i].w
+      if (headers[i].html) th.innerHTML = headers[i].html
+      else th.textContent = headers[i].text
+      tr.appendChild(th)
+    }
+    thead.appendChild(tr)
+    table.appendChild(thead)
+
+    // 全选/取消：DOM 与数据行 r.checked 双向同步（2026-08-21 修复：此前只改 DOM 导致执行时误写全部匹配行）
+    var selectAll = table.querySelector("#" + PREFIX + "product_select_all")
+    if (selectAll) {
+      selectAll.addEventListener("change", function () {
+        var checked = selectAll.checked
+        var boxes = table.querySelectorAll("input[type=checkbox]:not(#" + PREFIX + "product_select_all)")
+        for (var i = 0; i < boxes.length; i++) {
+          var enable = !boxes[i].disabled
+          boxes[i].checked = enable && checked
+          if (boxes[i]._row) boxes[i]._row.checked = boxes[i].checked   // 同步数据层，防执行时误写
+        }
+        refreshProductConfirmCount()
+      })
+    }
+
+    var statusMeta = {
+      ok:        { text: "✅ 将更新", color: "#059669", bg: "#f0fdf4", border: "#bbf7d0" },
+      same:      { text: "ℹ️ 值相同", color: "#6b7280", bg: "#f9fafb", border: "#e5e7eb" },
+      notfound:  { text: "⚠️ 未匹配", color: "#dc2626", bg: "#fef2f2", border: "#fca5a5" },
+      dup:       { text: "🔁 UPC 重复", color: "#d97706", bg: "#fffbeb", border: "#fde68a" }
+    }
+    var tbody = document.createElement("tbody")
+    for (var i = 0; i < previewRows.length; i++) {
+      (function (r) {
+        var meta = statusMeta[r.status] || statusMeta.notfound
+        var trRow = document.createElement("tr")
+        trRow.style.cssText = "border-bottom:1px solid #f3f4f6"
+        // 勾选
+        var tdCb = document.createElement("td")
+        tdCb.style.cssText = "padding:6px 10px;text-align:center;vertical-align:middle"
+        var cb = document.createElement("input")
+        cb.type = "checkbox"
+        cb.checked = !!r.checked
+        cb.disabled = !r.hasAction
+        cb._row = r                                   // 全选时通过它同步数据层
+        cb.addEventListener("change", function () {
+          r.checked = cb.checked
+          refreshProductConfirmCount()
+        })
+        tdCb.appendChild(cb)
+        trRow.appendChild(tdCb)
+        // UPC
+        trRow.appendChild(td(r.upc, "#111827", "600"))
+        // 中文简称 / 品牌 旧→新
+        trRow.appendChild(buildDiffTd(r.oldName, r.newName))
+        trRow.appendChild(buildDiffTd(r.oldBrand, r.newBrand))
+        // 状态徽章
+        var tdStatus = document.createElement("td")
+        tdStatus.style.cssText = "padding:6px 10px;text-align:center;vertical-align:middle"
+        tdStatus.appendChild(el("span", {
+          style: "display:inline-block;padding:2px 10px;border-radius:10px;font-size:11px;white-space:nowrap;color:" + meta.color + ";background:" + meta.bg + ";border:1px solid " + meta.border
+        }, meta.text))
+        trRow.appendChild(tdStatus)
+        tbody.appendChild(trRow)
+      })(previewRows[i])
+    }
+    table.appendChild(tbody)
+    refreshProductConfirmCount()
+    return table
+  }
+
+  // 确认按钮实时显示勾选行数；0 行时禁用（防误点导致批量误写，2026-08-21 修复）
+  function refreshProductConfirmCount() {
+    var btn = document.getElementById(PREFIX + "product_confirm_btn")
+    if (!btn) return
+    var boxes = document.querySelectorAll("#" + PREFIX + "modal_overlay tbody input[type=checkbox]")
+    var n = 0
+    for (var i = 0; i < boxes.length; i++) {
+      if (boxes[i].checked && !boxes[i].disabled) n++
+    }
+    btn.textContent = n > 0 ? "✅ 确认写入 Odoo（" + n + " 行）" : "✅ 确认写入 Odoo（0 行）"
+    btn.disabled = n === 0
+    btn.style.opacity = n === 0 ? "0.5" : "1"
+    btn.style.cursor = n === 0 ? "not-allowed" : "pointer"
+  }
+
+  // 旧值 → 新值 单元格（两行小字；textContent 自动转义防 XSS）
+  // Excel 值为空时按空写入（用户确认「匹配到就按 Excel 值更新，空不空无所谓」），新值为空直接显示空白、不加提示
+  function buildDiffTd(oldVal, newVal) {
+    var t = document.createElement("td")
+    t.style.cssText = "padding:6px 10px;text-align:center;vertical-align:middle"
+    var oldDiv = document.createElement("div")
+    oldDiv.style.cssText = "font-size:11px;color:#9ca3af;word-break:break-all;max-width:240px"
+    oldDiv.textContent = (oldVal === undefined || oldVal === null || oldVal === "") ? "—" : oldVal
+    t.appendChild(oldDiv)
+    var newDiv = document.createElement("div")
+    newDiv.style.cssText = "font-size:12px;color:#7c3aed;font-weight:600;word-break:break-all;max-width:240px;margin-top:2px"
+    newDiv.textContent = (newVal === undefined || newVal === null || newVal === "") ? "" : newVal
+    t.appendChild(newDiv)
+    return t
+  }
+
+  // 批量写回 product.product（name / brand，Char 直接写；不做比对，空值也写入；勾选行才写）
+  async function executeProductUpdate(previewRows, fileName) {
+    // 以 DOM 勾选状态为准同步数据层（防全选等操作导致数据与界面不同步，2026-08-21 修复）
+    var boxes = document.querySelectorAll("#" + PREFIX + "modal_overlay tbody input[type=checkbox]")
+    for (var i = 0; i < previewRows.length && i < boxes.length; i++) {
+      previewRows[i].checked = boxes[i].checked
+    }
+    var selected = previewRows.filter(function (r) { return r.checked && r.hasAction })
+    if (!selected.length) return
+    removeModals()
+
+    var logEntry = {
+      timestamp: new Date().toISOString(),
+      fileName: fileName,
+      totalRows: previewRows.length,
+      selectedRows: selected.length,
+      results: []
+    }
+
+    updateLoadingOverlay("正在写入 Odoo 产品...")
+    for (var i = 0; i < selected.length; i++) {
+      var row = selected[i]
+      // 不做比对：按 Excel 值直接写入 name/brand（空值也写入，用户 2026-08-21 确认）
+      var payload = {}
+      var changedDesc = []
+      payload[PRODUCT_ODOO_FIELDS.shortName] = row.newName
+      changedDesc.push("中文简称=" + row.newName)
+      payload[PRODUCT_ODOO_FIELDS.brand] = row.newBrand
+      changedDesc.push("品牌=" + row.newBrand)
+      try {
+        // context.lang=zh_CN：name 是 Odoo 多语言翻译字段，带 lang 写简体中文翻译（用户 zh_CN 界面显示的才是新值）；
+        // source 值此前已写入且=Excel 值，无需重复；brand 无 translate 不受影响（2026-08-21 修复）
+        await rpcCall("/web/dataset/call_kw/product.product/write", {
+          model: "product.product", method: "write", args: [[row.odooProductId], payload],
+          kwargs: { context: { lang: "zh_CN" } }
+        })
+        logEntry.results.push({ upc: row.upc, productId: row.odooProductId, status: "success", changes: changedDesc, old: { name: row.oldName, brand: row.oldBrand }, new: { name: row.newName, brand: row.newBrand } })
+      } catch (err) {
+        console.error("[Odoo Product] 写回失败 id=" + row.odooProductId, err)
+        logEntry.results.push({ upc: row.upc, productId: row.odooProductId, status: "failed", error: err.message || "写入失败", changes: changedDesc, old: { name: row.oldName, brand: row.oldBrand }, new: { name: row.newName, brand: row.newBrand } })
+      }
+    }
+    updateLoadingOverlay(null)
+
+    var skipped = previewRows.filter(function (r) { return !r.checked || !r.hasAction })
+    for (var s = 0; s < skipped.length; s++) {
+      logEntry.results.push({ upc: skipped[s].upc, status: "skipped", reason: skipped[s].error || "用户跳过或无需操作" })
+    }
+
+    saveLog(logEntry)
+    refreshCard()
+    showResultToast(logEntry)
+    // 写回成功后提示刷新 Odoo 页面（列表视图有缓存，需 F5 或重进菜单才显示新值）
+    setTimeout(function () {
+      showToast("💡 写入已完成，如 Odoo 页面未显示新值，请刷新页面（F5）或重新进入该菜单", "info")
+    }, 4200)
   }
 
   function selectExcelMode(modeId) {
@@ -2532,12 +3005,18 @@
     document.body.appendChild(createDraggableButton())
   }
 
-  if (isPurchaseOrderPage()) inject()
+  if (isAnyPage()) inject()
 
   window.addEventListener("hashchange", function () {
     var existing = document.getElementById(PREFIX + "btn")
-    if (isPurchaseOrderPage()) {
+    if (isAnyPage()) {
       if (!existing) inject()
+      // 页面类型切换时重置默认 Tab（采购页 → excel，产品页 → product），卡片开着则刷新
+      var defaultTab = isProductPage() ? "product" : "excel"
+      if (appState.activeTab !== defaultTab && (isPurchaseOrderPage() || isProductPage())) {
+        appState.activeTab = defaultTab
+        refreshCard()
+      }
     } else {
       if (existing) existing.remove()
       if (cardEl) { cardEl.remove(); cardEl = null }

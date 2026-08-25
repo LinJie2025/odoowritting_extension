@@ -1,7 +1,7 @@
 # Odoo Excel Importer — 项目文档
 
 > 本文件是项目的**权威文档**，与代码同步维护。任何 Agent 接任务前必须先读本文件。
-> 最后更新：2026-08-20（manifest v1.10.0）
+> 最后更新：2026-08-21（manifest v1.11.0，新增「商品库更新」Tab）
 
 ---
 
@@ -14,8 +14,8 @@
 | 业务目的 | 把采购 Excel / 供应商 PDF 数据批量写入 Odoo 采购订单（RFQ）明细行 |
 | 技术栈 | 纯原生 JS（**ES5 风格：`var` + IIFE + function 声明**），无框架、无构建步骤 |
 | 第三方库 | `lib/xlsx.full.min.js`（SheetJS）、`lib/pdf.min.js` + `lib/pdf.worker.min.js`（pdfjs-dist **3.11.174 UMD 版**，4.x 起无 UMD 故锁定 3.x） |
-| 运行环境 | 任意 Odoo 实例的 `purchase.order` 页面（URL hash 含 `model=purchase.order`） |
-| 版本 | manifest v1.10.0 |
+| 运行环境 | Odoo 实例的 `purchase.order` 页面 **或** `product.product`（产品变体）页面（URL hash 含对应 `model=`） |
+| 版本 | manifest v1.11.0 |
 
 **核心价值**：人工核对采购数据 → 自动写回 Odoo 的「数量 / 包装数量 / 整箱批发价 / 备注」字段，避免逐行手工录入。
 
@@ -110,7 +110,7 @@ odoowritting_extension/
 | 业务逻辑 | 匹配修正规则 | `applyPdfByMode`（入口分发，PDF/Excel 两流共用）、`applyPdfSet`（套装）、`applyPdfSingle`（单件）、`parseConvertedPdfExcel`（Excel 流：PDF 转换版 Excel 解析，v1.7.0） |
 | 日志 | localStorage 存取 | `saveLog`/`getLog`/`clearLog`/`downloadLog` |
 | 状态 | 应用状态对象 | `appState`（含 `activeTab`）、`pdfState`、`excelState`、`dragCtx` |
-| UI | 按钮/卡片/双 Tab/上传区/日志区 | `createDraggableButton`、`renderCardContent`、**`renderTabSwitch`（双 Tab）**、`renderExcelZone`、`renderPdfZone`、`renderModePicker`（两流共用） |
+| UI | 按钮/卡片/三 Tab/上传区/日志区 | `createDraggableButton`、`renderCardContent`、**`renderTabSwitch`（三 Tab）**、`renderExcelZone`、`renderPdfZone`、**`renderProductZone`（商品库，v1.11.0）**、`renderModePicker`（两流共用） |
 | 预览 Modal | 双流共用 1 套 | `buildPdfPreviewModal(previewRows, fileName, source)`（source='pdf'/'excel'）、`loadOrderLineMap`、`buildPreviewRows` |
 | 执行写回 | 双流共用批量写入 | `executePdfUpdate`（两流共用，字段经 ODOO_FIELDS 映射） |
 | 初始化 | 注入条件与路由 | `inject()`、`isPurchaseOrderPage()`、`hashchange` 监听 |
@@ -275,6 +275,18 @@ odoowritting_extension/
 
 **样本实测（2026-08-19，node 单测）**：`Castlers Box 08.27_Order Confirmation_35548880.xlsx` → 格式 B、Coupon=-73702.326、64 行、UPC 全部合法、description 含 xN（套装单件数量）、Subtotal=UnitPrice×Qty 验算通过。
 
+### 6.4 商品库更新流（manifest v1.11.0，2026-08-21 用户需求）
+
+> **用户需求（2026-08-21）**：入口在采购单顶部导航「产品 → 产品变体」页（`model=product.product`）；上传商品库 Excel，按 UPC 定位产品变体，用 Excel「品牌」「中文简称」更新 Odoo 对应字段。
+
+- **注入**：`isAnyPage()` = `model=purchase.order` **或** `model=product.product`（v1.11.0 放宽）；产品页默认 Tab = 商品库更新，采购页默认 Excel；hashchange 按页面类型重置默认 Tab
+- **Excel 列（`PRODUCT_EXCEL_COLS`，表头第 1 行按名定位 + 正则容错）**：`UPC`（12/13 位数字，按字符串 trim 处理）| `品牌` | `中文简称`（样本实测含 `\n`，解析时转空格）
+- **Odoo 字段（`PRODUCT_ODOO_FIELDS`，用户确认均为 Char）**：`default_code`（定位键）| `brand`（品牌）| `name`（中文简称）
+- **流程**：上传商品库 Excel（`makeDropZone` 复用）→ `parseProductExcel` → `loadProductByUpc`（search_read `product.product`，domain `default_code in [...]`，UPC 去重后 500/批分块）→ `buildProductPreviewRows` → `buildProductPreviewModal`（UPC + 中文简称/品牌「旧→新」对照 + 勾选）→ `executeProductUpdate`（批量 write `{name, brand}`）
+- **行状态**：`ok`（✅ 待更新，UPC 匹配到唯一产品，**默认全勾选**）/ `notfound`（⚠️ 未匹配，UPC 无对应产品，注明原因）/ `dup`（🔁 UPC 匹配到多个产品，注明原因需人工）；**不做新旧比对**（用户 2026-08-21 确认）
+- **写回**：Excel 为权威源，`{name, brand}` 按 Excel 值**直接写入（空值也照写，无空值保护）**；仅勾选行写回；日志/toast 与双流共用
+- **样本实测（2026-08-21，openpyxl）**：`极牛产品名称-KVIVA(1).xlsx` → Sheet1 142 行（1 表头 + 141 数据）、3 列、无合并单元格、UPC 12/13 位混存（如 8809640734526 / 880933516775）、中文简称含换行
+
 ---
 
 ## 7. UI 结构
@@ -282,12 +294,12 @@ odoowritting_extension/
 | 组件 | 说明 |
 |---|---|
 | 可拖动按钮 📥 | 右下角 52px 圆形紫色按钮，位置存 localStorage；拖文件到按钮上提示在卡片内选择入口 |
-| 悬浮卡片 | 点按钮展开（340×500px），含 Header、双 Tab、上传区、日志区 |
-| 双 Tab | 「📊 Excel 导入」/「📄 PDF 修正」（`appState.activeTab`，v1.6.0 恢复） |
+| 悬浮卡片 | 点按钮展开（340×500px），含 Header、三 Tab、上传区、日志区 |
+| 三 Tab | 「📊 Excel 导入」/「📄 PDF 修正」/「🏷 商品库更新」（v1.11.0 新增；`appState.activeTab`，产品变体页默认商品库 Tab，采购页默认 Excel） |
 | 入口选择器 | 步骤 0：单件📦 / 套装🎁 两张卡片（PDF/Excel 两流共用 `renderModePicker`），选中后锁入口，可「切换入口」重置 |
 | 步骤指示器 | PDF 区：① 上传 PDF → ② 上传 Excel → ③ 预览确认；Excel 区（v1.7.0）：① 上传转换版 Excel → ② 上传采购订单 Excel → ③ 预览确认（当前步紫色、已完成绿色、可点击回退） |
 | 常驻错误框 | `pdfState.error` / `excelState.error`：解析失败时在卡片内红色常驻显示原因，下次成功自动清除 |
-| 预览 Modal | 92vw 宽居中弹窗，双流共用（v1.7.0 起统一 pdf 布局：数量核对/PDF Qty 列两流都有）；`mode` 优先取预览行自带标记 |
+| 预览 Modal | 92vw 宽居中弹窗，双流共用（v1.7.0 起统一 pdf 布局：数量核对/PDF Qty 列两流都有）；`mode` 优先取预览行自带标记；商品库更新 Modal（v1.11.0）：UPC + 中文简称/品牌 旧→新 对照 + 勾选写回 |
 | 日志区 | 最近一次执行结果（成功/失败/跳过计数），可下载 JSON、清除 |
 | Toast / Loading | 右下角提示；顶部紫色 loading 胶囊（`updateLoadingOverlay`） |
 
@@ -343,6 +355,7 @@ odoowritting_extension/
 | 12 | Excel 流转换版解析 + 两步上传 | `parseConvertedPdfExcel` 等 | ⚠️ v1.7.0 已实现，样本单测通过，待 Chrome 冒烟验证 |
 | 13 | Odoo 匹配键改 UPC+包装（default_code + packaging qty） | `getOrderLines`/`loadOrderLineMap`/`buildPreviewRows` | ⚠️ v1.9.0 已实现，逻辑单测通过，待 Chrome 冒烟验证 |
 | 14 | PDF↔Excel 匹配重构为两级匹配（SKU 优先 + UPC 包装拆分兜底） | `matchPdfToExcel`/`extractDescPack`/`markQtyMismatch` | ⚠️ v2.0（manifest v1.10.0）已实现，33 断言单测通过，待 Chrome 冒烟验证 |
+| 15 | 商品库更新 Tab（UPC 定位产品变体，写回 name/brand） | `productState`/`renderProductZone`/`loadProductByUpc`/`executeProductUpdate` | ⚠️ v1.11.0 已实现（语法 + 状态判定单测通过），待 Chrome 冒烟验证（product.product 页注入、UPC 匹配、写回 name/brand） |
 
 ---
 
