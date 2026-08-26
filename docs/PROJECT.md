@@ -1,7 +1,7 @@
 # Odoo Excel Importer — 项目文档
 
 > 本文件是项目的**权威文档**，与代码同步维护。任何 Agent 接任务前必须先读本文件。
-> 最后更新：2026-08-21（manifest v1.11.0，新增「商品库更新」Tab）
+> 最后更新：2026-08-25（manifest v1.12.3，预览 Odoo 查询加缓存）
 
 ---
 
@@ -15,7 +15,7 @@
 | 技术栈 | 纯原生 JS（**ES5 风格：`var` + IIFE + function 声明**），无框架、无构建步骤 |
 | 第三方库 | `lib/xlsx.full.min.js`（SheetJS）、`lib/pdf.min.js` + `lib/pdf.worker.min.js`（pdfjs-dist **3.11.174 UMD 版**，4.x 起无 UMD 故锁定 3.x） |
 | 运行环境 | Odoo 实例的 `purchase.order` 页面 **或** `product.product`（产品变体）页面（URL hash 含对应 `model=`） |
-| 版本 | manifest v1.11.0 |
+| 版本 | manifest v1.12.0 |
 
 **核心价值**：人工核对采购数据 → 自动写回 Odoo 的「数量 / 包装数量 / 整箱批发价 / 备注」字段，避免逐行手工录入。
 
@@ -86,7 +86,7 @@ odoowritting_extension/
 | `unitPrice` | 单价 | 单价 → price_unit |
 | `remark` | 备注 | 缺货等 |
 | `orderRef` | 订单关联 | 查 PO（=name） |
-| `partnerRef` | 参考号 | 查 PO（=name，v1.7.1 新增）：**先用参考号查，查不到再用订单关联**（`loadOrderLineMap`）；命中订单行按两个键都注册进 lineMap |
+| `partnerRef` | 参考号 | 查 PO（=name，v1.7.1 新增）：**先用参考号查，查不到再用订单关联**（`loadOrderLineMap`）；命中订单行按两个键都注册进 lineMap。**v1.12.2**：模糊匹配排除「内部参考号」（UPC 列）——无「参考号」列时 partnerRef 为空，直接走「订单关联」匹配（用户 2026-08-25 确认） |
 
 ### 3.3 其他
 
@@ -258,10 +258,18 @@ odoowritting_extension/
 
 ```
 步骤0 选入口（单件📦 / 套装🎁）——与 PDF 区共用 renderModePicker
-步骤1 上传转换版 Excel → parseConvertedPdfExcel（新增：输出与 extractPdfTable 同构）
+步骤1 上传转换版 Excel（可多个，v1.12.0）→ 逐个 parseConvertedPdfExcel → 点「下一步」mergeConvFiles 合并
 步骤2 上传采购订单 Excel → parseOrderExcel → applyPdfByMode（与 PDF 流同一分发）
 步骤3 预览 buildPdfPreviewModal（pdf 布局）→ executePdfUpdate 写回
 ```
+
+**多转换版文件（v1.12.0，2026-08-25 用户需求）**：
+- 上传区支持**反复添加**多个转换版 Excel：已添加文件列表（名称/行数/删除单个）+「继续添加」+「下一步」合并
+- `excelState` 改为 `convFiles[]`（每文件 {name, rows, format, coupon}）+ `convRows`（合并产物，点「下一步」生成）
+- **合并规则**（`mergeConvFiles`，用户确认）：同 UPC+包装去重（key 与拆分匹配键一致 = `UPC+description的(xN)`，提取不到 = 原 UPC）；合并行 **Qty 相加、Subtotal 相加**（价格×箱数与 0.9总价比对一致），UNIT PRICE/catalog/description 取第一个
+- **Coupon**（`mergeCoupon`，用户确认）：任一文件非 0 → 取该值（触发 ×0.9）；全 0 → 0
+- 回步骤①保留已添加列表可编辑；「重置」全清；单文件解析失败仅提示不影响已添加文件
+- 合并后 rows 直接喂 `applyPdfByMode`，匹配/预览/写回/数量核对零改动
 
 **`parseConvertedPdfExcel(data)`（新增，content.js）**：
 - 表头行 = 首个含 `UPC|EAN` 关键字的行（转换版 Excel 前面有公司/客户信息行）
@@ -300,7 +308,7 @@ odoowritting_extension/
 | 入口选择器 | 步骤 0：单件📦 / 套装🎁 两张卡片（PDF/Excel 两流共用 `renderModePicker`），选中后锁入口，可「切换入口」重置 |
 | 步骤指示器 | PDF 区：① 上传 PDF → ② 上传 Excel → ③ 预览确认；Excel 区（v1.7.0）：① 上传转换版 Excel → ② 上传采购订单 Excel → ③ 预览确认（当前步紫色、已完成绿色、可点击回退） |
 | 常驻错误框 | `pdfState.error` / `excelState.error`：解析失败时在卡片内红色常驻显示原因，下次成功自动清除 |
-| 预览 Modal | 92vw 宽居中弹窗，双流共用（v1.7.0 起统一 pdf 布局：数量核对/PDF Qty 列两流都有）；`mode` 优先取预览行自带标记；商品库更新 Modal（v1.11.0）：UPC + 中文简称/品牌 旧→新 对照 + 勾选写回 |
+| 预览 Modal | 92vw 宽居中弹窗，双流共用（v1.7.0 起统一 pdf 布局：数量核对/PDF Qty 列两流都有）；`mode` 优先取预览行自带标记；商品库更新 Modal（v1.11.0）：UPC + 中文简称/品牌 旧→新 对照 + 勾选写回。**预览 Odoo 查询缓存（v1.12.3）**：`buildPdfPreviewRows` 缓存 lineData，同一 changes（引用相同）重复预览不重查 Odoo（Modal 关闭重开/反复点预览秒开），数据重新生成（重新上传/合并）自动失效 |
 | 日志区 | 最近一次执行结果（成功/失败/跳过计数），可下载 JSON、清除 |
 | Toast / Loading | 右下角提示；顶部紫色 loading 胶囊（`updateLoadingOverlay`） |
 
@@ -357,13 +365,14 @@ odoowritting_extension/
 | 13 | Odoo 匹配键改 UPC+包装（default_code + packaging qty） | `getOrderLines`/`loadOrderLineMap`/`buildPreviewRows` | ⚠️ v1.9.0 已实现，逻辑单测通过，待 Chrome 冒烟验证 |
 | 14 | PDF↔Excel 匹配重构为两级匹配（SKU 优先 + UPC 包装拆分兜底） | `matchPdfToExcel`/`extractDescPack`/`markQtyMismatch` | ⚠️ v2.0（manifest v1.10.0）已实现，33 断言单测通过，待 Chrome 冒烟验证 |
 | 15 | 商品库更新 Tab（UPC 定位产品变体，写回 name/brand） | `productState`/`renderProductZone`/`loadProductByUpc`/`executeProductUpdate` | ⚠️ v1.11.0 已实现（语法 + 状态判定单测通过），待 Chrome 冒烟验证（product.product 页注入、UPC 匹配、写回 name/brand） |
+| 16 | Excel 导入支持多个转换版文件（列表可删 + 合并去重） | `excelState.convFiles`/`mergeConvFiles`/`mergeCoupon`/`finishConvFiles`/`removeConvFile` | ⚠️ v1.12.0 已实现（17 断言单测通过），待 Chrome 冒烟验证（多文件添加/删除、同 UPC 同包装 Qty 相加、Coupon 任一非0、双流回归） |
 
 ---
 
 ## 10. 快速上手（新 Agent 3 分钟版）
 
 1. **只改一个文件**：`content.js`（IIFE 单文件）；字段映射在顶部两个常量对象
-2. **两条在线流程（v1.7.0）**：📊 Excel 导入（上传「PDF 转换版 Excel」→ 上传采购订单 Excel → 与 PDF 同逻辑匹配修正 → Modal 写回）+ 📄 PDF 修正（上传 PDF → 上传 Excel → 匹配修正 → Modal 写回）；两流在 `applyPdfByMode` 汇合，共用 `parseOrderExcel` / `loadOrderLineMap` / `buildPreviewRows` / Modal / `executePdfUpdate`
+2. **两条在线流程（v1.7.0）**：📊 Excel 导入（上传「PDF 转换版 Excel」**可多个（v1.12.0），合并去重后** → 上传采购订单 Excel → 与 PDF 同逻辑匹配修正 → Modal 写回）+ 📄 PDF 修正（上传 PDF → 上传 Excel → 匹配修正 → Modal 写回）；两流在 `applyPdfByMode` 汇合，共用 `parseOrderExcel` / `loadOrderLineMap` / `buildPreviewRows` / Modal / `executePdfUpdate`
 3. **两级匹配（v2.0）**：PDF/转换版 Excel ↔ 采购单 Excel 先按 Catalog↔SKU 匹配，匹配不上的行走 UPC 匹配（同 UPC 多行用包装拆分：PDF 侧 description "(xN)"、Excel 侧包装列 pieces，拼成 `UPC+N` 精确配对；唯一 UPC 直接匹配）；数量核对按 matchKey（Catalog/UPC/拆分键）分组。**UPC+包装是 Odoo 匹配键（v1.9）**：Excel「内部参考号」+「订单行/包装」件数 ↔ Odoo `product.default_code` + `product_packaging_id.qty`；查 PO（=name）优先用「参考号」列、查不到再用「订单关联」列（v1.7.1）
 4. **无构建、无测试**：改完同步到 `odoowritting_extension/` 子目录后到 Chrome 手动验证
 5. Git 提交必须过 commitlint（husky），格式 `type(scope): subject`
