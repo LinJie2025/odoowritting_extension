@@ -583,7 +583,15 @@
       partnerRef: colIdx(EXCEL_COLS.partnerRef)
     }
     if (idx.upc < 0) idx.upc = colIdxFuzzy(["内部参考号", "UPC", "EAN"])
-    if (idx.partnerRef < 0) idx.partnerRef = colIdxFuzzy(["参考号", "Reference", "reference"])
+    // v1.12.2：参考号模糊匹配必须排除「内部参考号」（UPC 列）——"内部参考号"含子串"参考号"，无「参考号」列时会误命中 UPC 列
+    // 无「参考号」列 → partnerRef 为空 → loadOrderLineMap 直接用「订单关联」查 PO（用户 2026-08-25 确认）
+    if (idx.partnerRef < 0) {
+      for (var prj = 0; prj < header.length; prj++) {
+        var prh = header[prj]
+        if (!prh || prh.indexOf("内部参考号") !== -1) continue
+        if (prh.indexOf("参考号") !== -1 || /reference/i.test(prh)) { idx.partnerRef = prj; break }
+      }
+    }
     // 「包装/SKU」优先于「Box SKU」——两者都含 "SKU"，若按含 SKU 兜底会先命中 Box SKU 列（2026-08-18 修复）
     if (idx.catalog < 0) idx.catalog = colIdxFuzzy(["包装/SKU", "SKU_x", "SKU", "Catalog", "货号"])
     if (idx.upc < 0) throw new Error("未找到 UPC 列（「" + EXCEL_COLS.upc + "」）")
@@ -686,6 +694,40 @@
     }
 
     return { format: hasHsCode ? "B" : "A", coupon: coupon, rows: rows }
+  }
+
+  // ── 多转换版 Excel 合并（v1.12.0，2026-08-25 用户需求）──
+  // 同 UPC+包装去重（key 与 matchPdfToExcel 拆分键一致：UPC+description 的 "(xN)"，提取不到 = 原 UPC）；
+  // 合并行 Qty 相加、Subtotal 相加（价格×箱数才与 0.9总价比对一致），UNIT PRICE/catalog/description 取第一个
+  function mergeConvFiles(files) {
+    var map = {}, keys = []
+    for (var f = 0; f < files.length; f++) {
+      var rows = files[f].rows
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i]
+        var pn = extractDescPack(r.description)
+        var key = pn ? r.upc + "+" + pn : r.upc
+        var t = map[key]
+        if (t) {
+          var q1 = parseInt(t.qty, 10), q2 = parseInt(r.qty, 10)
+          if (!isNaN(q1) && !isNaN(q2)) t.qty = String(q1 + q2)
+          var s1 = parseFloat(t.subtotal), s2 = parseFloat(r.subtotal)
+          if (!isNaN(s1) && !isNaN(s2)) t.subtotal = String(s1 + s2)
+        } else {
+          map[key] = { upc: r.upc, catalog: r.catalog, qty: r.qty, unitPrice: r.unitPrice, subtotal: r.subtotal, description: r.description }
+          keys.push(key)
+        }
+      }
+    }
+    return keys.map(function (k) { return map[k] })
+  }
+
+  // 多文件 Coupon 合并：任一文件非 0 → 取该值（触发 ×0.9）；全部 0 → 0
+  function mergeCoupon(files) {
+    for (var i = 0; i < files.length; i++) {
+      if (files[i].coupon) return files[i].coupon
+    }
+    return 0
   }
 
   // ── 通用匹配（v2.0 重构，2026-08-20）：两级匹配 ──
@@ -1062,10 +1104,11 @@
   // Excel 导入区流程状态（2026-08-19 改造：上传「PDF 转换版 Excel」→ 再传采购订单 Excel → 与 PDF 流同逻辑比对写回）
   var excelState = {
     mode: null,          // 入口: null | 'single' | 'set'
-    convRows: null,      // 转换版 Excel 解析出的表格数据行（与 extractPdfTable 输出同构）
-    convFileName: null,
-    convFormat: null,    // 格式: 'A'(无HS CODE) | 'B'(有HS CODE)
-    coupon: 0,           // 汇总区 Coupon 值（决定是否 ×0.9）
+    convFiles: [],       // 已添加的转换版文件 [{name, rows, format, coupon}]（v1.12.0 多文件）
+    convRows: null,      // 合并去重后的表格数据行（点「下一步」时由 mergeConvFiles 生成）
+    convFileName: null,  // 展示用：全部文件名（", " 连接）
+    convFormat: null,    // 展示用：格式（多文件混合时取第一个文件的）
+    coupon: 0,           // 合并后 Coupon（任一文件非 0 → 取该值触发 ×0.9；全 0 → 0）
     excelRows: null,     // 采购订单 Excel 解析结果
     excelFileName: null,
     changes: null,       // applyPdfByMode 结果（与 PDF 流同一逻辑）
@@ -1324,19 +1367,21 @@
     // Tab 栏：📊 Excel 导入 / 📄 PDF 修正 / 🏷 商品库更新（v1.11.0）
     frag.appendChild(renderTabSwitch())
 
-    // 内容区（按 Tab 路由）
-    if (isExcelTab) frag.appendChild(renderExcelZone())
-    else if (isProductTab) frag.appendChild(renderProductZone())
-    else frag.appendChild(renderPdfZone())
+    // 内容区（按 Tab 路由）+ 日志区（v1.12.1：包可滚动容器 flex:1，文件列表超出卡片高度时内容区出现滚动条，Header/Tab 固定）
+    var bodyWrap = el("div", { style: "flex:1;overflow-y:auto;min-height:0;padding-bottom:10px" })
+    if (isExcelTab) bodyWrap.appendChild(renderExcelZone())
+    else if (isProductTab) bodyWrap.appendChild(renderProductZone())
+    else bodyWrap.appendChild(renderPdfZone())
 
     // 日志区 (有日志才显示)
     var log = getLog()
     if (log) {
-      frag.appendChild(el("div", { style: "padding:0 16px;margin-top:2px" }, [
+      bodyWrap.appendChild(el("div", { style: "padding:0 16px;margin-top:2px" }, [
         el("div", { style: "font-size:11px;color:#9ca3af;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px" }, "最近日志"),
         renderLogSection(log)
       ]))
     }
+    frag.appendChild(bodyWrap)
 
     return frag
   }
@@ -1638,7 +1683,7 @@
     if (excelState.convRows) {
       wrap.appendChild(el("div", {
         style: "font-size:12px;color:#059669;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px 10px"
-      }, "✅ 转换版 Excel 已解析：" + (excelState.convFileName || "") + "（" + excelState.convRows.length + " 行，格式" + (excelState.convFormat || "?") + (excelState.coupon ? "，Coupon=" + excelState.coupon : "") + "）"))
+      }, "✅ 已合并 " + excelState.convFiles.length + " 个转换版文件（" + excelState.convRows.length + " 行，格式" + (excelState.convFormat || "?") + (excelState.coupon ? "，Coupon=" + excelState.coupon : "") + "）"))
     }
     if (excelState.excelRows) {
       wrap.appendChild(el("div", {
@@ -1650,8 +1695,34 @@
       // 步骤0：选择入口（单件 / 套装，与 PDF 区共用选择器）
       wrap.appendChild(renderModePicker(selectExcelMode))
     } else if (!excelState.convRows) {
-      // 步骤1：上传转换版 Excel（PDF 转的 Excel，含 UPC/EAN 表头）
-      wrap.appendChild(makeDropZone("点击上传或拖拽转换版 Excel", "PDF 转成的 Excel（.xlsx / .xls），含 UPC/EAN 表头", "📑", "excel", function (file) { processExcelFile(file) }))
+      // 步骤1：上传转换版 Excel（可多个，v1.12.0）
+      if (excelState.convFiles.length) {
+        // 已添加文件列表（可删除单个）
+        var listWrap = el("div", { style: "display:flex;flex-direction:column;gap:6px" })
+        for (var fi = 0; fi < excelState.convFiles.length; fi++) {
+          (function (i, f) {
+            listWrap.appendChild(el("div", {
+              style: "display:flex;justify-content:space-between;align-items:center;font-size:12px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px;padding:6px 10px"
+            }, [
+              el("span", { style: "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, "📑 " + f.name + "（" + f.rows.length + " 行）"),
+              el("span", {
+                onclick: function () { removeConvFile(i) },
+                title: "删除该文件",
+                style: "cursor:pointer;color:#dc2626;font-weight:700;margin-left:8px;padding:0 4px;user-select:none"
+              }, "✕")
+            ]))
+          })(fi, excelState.convFiles[fi])
+        }
+        wrap.appendChild(listWrap)
+        // 继续添加 + 下一步（合并）
+        wrap.appendChild(makeDropZone("继续添加转换版 Excel（可选）", "PDF 转成的 Excel（.xlsx / .xls），含 UPC/EAN 表头", "📑", "excel", function (file) { processExcelFile(file) }))
+        wrap.appendChild(el("button", {
+          onclick: function () { finishConvFiles() },
+          style: "padding:10px;border:none;border-radius:8px;background:#7c3aed;color:#fff;font-size:13px;font-weight:600;cursor:pointer"
+        }, "下一步：上传采购订单 Excel"))
+      } else {
+        wrap.appendChild(makeDropZone("点击上传或拖拽转换版 Excel（可多个）", "PDF 转成的 Excel（.xlsx / .xls），含 UPC/EAN 表头，可反复添加", "📑", "excel", function (file) { processExcelFile(file) }))
+      }
     } else if (!excelState.excelRows) {
       // 步骤2：上传采购订单 Excel（匹配规则与 PDF 流一致：SKU 优先、UPC 兜底，v1.7.2）
       wrap.appendChild(makeDropZone("请上传采购订单 Excel", "需含 SKU 列（优先匹配）与内部参考号列（SKU 缺失兜底）", "📊", "excel", function (file) { processExcelOrderFile(file) }))
@@ -2117,6 +2188,7 @@
 
   function clearExcelData() {
     excelState.mode = null
+    excelState.convFiles = []
     excelState.convRows = null
     excelState.convFileName = null
     excelState.convFormat = null
@@ -2133,6 +2205,7 @@
   }
 
   // 步骤条跳转（Excel 流）：1=上传转换版 Excel, 2=上传采购订单 Excel, 3=预览确认
+  // v1.12.0：回步骤1 保留已添加文件列表（可增删后重新点「下一步」合并），清掉合并结果与下游
   function jumpExcelStep(target) {
     if (target === 1) {
       excelState.convRows = null
@@ -2301,8 +2374,8 @@
     }
   }
 
-  // ── Excel 导入流（2026-08-19 改造：与 PDF 流同逻辑）──
-  // 步骤1：上传「PDF 转换版 Excel」→ parseConvertedPdfExcel（格式A/B + Coupon + 表格行）
+  // ── Excel 导入流（2026-08-19 改造：与 PDF 流同逻辑；v1.12.0 支持多个转换版文件）──
+  // 步骤1：上传「PDF 转换版 Excel」（可多个）→ 解析后追加到 convFiles（不立即合并，点「下一步」再合并）
   async function processExcelFile(file) {
     try {
       showToast("解析转换版 Excel 中...", "info")
@@ -2315,21 +2388,46 @@
         showToast(excelState.error, "error")
         return
       }
-      excelState.convRows = result.rows
-      excelState.convFileName = file.name
-      excelState.convFormat = result.format
-      excelState.coupon = result.coupon || 0
+      excelState.convFiles.push({ name: file.name, rows: result.rows, format: result.format, coupon: result.coupon || 0 })
       excelState.excelRows = null
       excelState.excelFileName = null
       excelState.changes = null
       refreshCard()
-      showToast("转换版 Excel 解析成功：" + result.rows.length + " 行（格式" + result.format + "，Coupon=" + excelState.coupon + "），请上传采购订单 Excel", "success")
+      showToast("已添加 " + file.name + "（" + result.rows.length + " 行，格式" + result.format + "），可继续添加或点「下一步」", "success")
     } catch (err) {
-      excelState.error = err.message || String(err)
-      refreshCard()
-      showToast("转换版 Excel 解析失败: " + excelState.error, "error")
+      // 解析失败：仅提示，不影响已添加的文件
+      showToast("转换版 Excel 解析失败: " + (err.message || String(err)), "error")
       console.error("[Odoo Excel]", err)
     }
+  }
+
+  // 步骤1「下一步」：合并全部转换版文件 → convRows（含 Coupon 合并、文件名汇总）
+  function finishConvFiles() {
+    if (!excelState.convFiles.length) return
+    excelState.convRows = mergeConvFiles(excelState.convFiles)
+    excelState.coupon = mergeCoupon(excelState.convFiles)
+    excelState.convFileName = excelState.convFiles.map(function (f) { return f.name }).join(", ")
+    excelState.convFormat = excelState.convFiles[0].format
+    excelState.excelRows = null
+    excelState.excelFileName = null
+    excelState.changes = null
+    excelState.error = null
+    refreshCard()
+    showToast("已合并 " + excelState.convFiles.length + " 个转换版文件（" + excelState.convRows.length + " 行），请上传采购订单 Excel", "success")
+  }
+
+  // 删除已添加的转换版文件（合并结果作废，需重新点「下一步」）
+  function removeConvFile(idx) {
+    if (idx < 0 || idx >= excelState.convFiles.length) return
+    excelState.convFiles.splice(idx, 1)
+    excelState.convRows = null
+    excelState.convFileName = null
+    excelState.convFormat = null
+    excelState.coupon = 0
+    excelState.excelRows = null
+    excelState.excelFileName = null
+    excelState.changes = null
+    refreshCard()
   }
 
   // 步骤2：上传采购订单 Excel → 与 PDF 流同一套匹配修正逻辑（applyPdfByMode）
@@ -2406,6 +2504,10 @@
     return { map: lineMap, cnt: cnt }
   }
 
+  // 预览 Odoo 查询缓存（v1.12.3，2026-08-25 用户需求）：同一 changes 数组（引用相同）重复预览时
+  // 复用已查的 lineData，不再重复请求 Odoo（Modal 关闭重开 / 反复点预览都不重查，直到数据重新生成）
+  var previewLineCache = { changes: null, lineData: null }
+
   // 构建 PDF 区预览行（含 Odoo 订单行匹配；参考号/订单关联去重成 refPairs）
   async function buildPdfPreviewRows(changes) {
     var seen = {}, refPairs = []
@@ -2417,7 +2519,14 @@
       seen[k] = true
       refPairs.push({ orderRef: c.orderRef || "", partnerRef: c.partnerRef || "" })
     }
-    var lineData = await loadOrderLineMap(refPairs)
+    var lineData
+    if (previewLineCache.changes === changes && previewLineCache.lineData) {
+      lineData = previewLineCache.lineData   // 缓存命中：不查 Odoo
+    } else {
+      lineData = await loadOrderLineMap(refPairs)
+      previewLineCache.changes = changes
+      previewLineCache.lineData = lineData
+    }
     return buildPreviewRows(changes, lineData)
   }
 
