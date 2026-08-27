@@ -27,6 +27,7 @@
 | 注入条件 | URL hash 含 `model=purchase.order` **或** `model=product.product`（v1.11.0 放宽；产品页默认商品库 Tab）的页面注入按钮 |
 | 价格规则 | ⚠️ **v3.0（2026-08-26 用户需求）**：modal 价格**原值比对基准 = Odoo 订单行现值**（单价↔`price_unit`、0.9箱规价↔`box_wholesale_price`、0.9总价↔`price_subtotal`），**采购单 Excel 价格列不再作比对基准**；实现 = `applyPdf*` 价格字段 oldValue 占位 + `expr`，`buildPreviewRows` 命中 Odoo 行后回填重算 changed/reason（缺货行跳过）。**箱规价字段已移除**（Odoo 无对应字段）；整箱批发价计算 = PDF UNIT PRICE×0.9（`calcBoxPrice` 整数分运算） |
 | 缺货写回 | ⚠️ **v1.12.4**（取代 v1.8.0）：**所有缺货行**（①匹配不上 + ②包装数量空/0——**v3.0 由 abw交货箱数改为包装数量列判断**，Excel 入口统一）写回时除备注「缺货」外，**单价（price_unit）/ 整箱批发价（box_wholesale_price）置 0 写回**；单件入口缺货②追加「整箱批发价」字段（key=boxWholesale，v1.12.4 新增）。旧规则「Excel 入口缺货行价格不写回」已作废 |
+| SKU 更新 | ⚠️ **v3.4（2026-08-27 用户需求，v3.3 修订）**：两级匹配中 **UPC 匹配成功**（SKU 匹配失败，`matchLevel=upc`）→ 认为 SKU 已变更，用**转换 Excel 的 SKU**（pdf.catalog）更新 `product.packaging`：**采购单 SKU 列按入口区分**（`parseOrderExcel(mode)`/`colIdxCatalog`）——单件入口用「订单行/包装/SKU」列（fuzzy 跳过含 Box 列）、套装入口用「订单行/包装/Box SKU」列；单件**不识别规格**直接定位 qty=1 记录写 `single_sku`，套装保留 XX 比对（description xN → "1 box of XX pieces"）写 `box_sku`；SKU 匹配成功不更新；Modal SKU 列旧→新对照、变更默认勾选、失败文案拆 5 种、找不到规格跳过并提示；写回 `product.packaging.write` 独立于订单行（详见 docs/PROJECT.md §6.5） |
 | 套装扣减 | ⚠️ 已作废（v1.5.0 起改为求和比对 + modal 提示，不自动扣减） |
 | ❌ 未实现 | 无重大未实现项；待办见 docs/PROJECT.md §9（Excel 公式列缓存值待真实样本验证、v1.7.0 待 Chrome 冒烟） |
 | Git | Conventional Commits（husky+commitlint 强制），scope 建议 `excel`/`ui`/`import`/`config`/`pdf` |
@@ -52,6 +53,8 @@
 - [x] **modal 按订单关联分组小计**（v3.1 / manifest v1.14.0 已实现）：套装入口表格内每组尾部插「{订单关联号} 小计」行，只对 0.9总价列做组内合计（全部行），随编辑实时刷新；单件入口（无 total09）不插；底部全表合计行保留（详见 docs/PROJECT.md §6.2/#18）
 - [x] **modal 去掉整箱批发价列**（v3.1.1 / manifest v1.14.1 已实现）：fieldOrder/FIELD_LABELS/SUM_KEYS 移除 boxWholesale 列；**缺货行整箱批发价置 0 写回不受影响**（boxWholesale 字段仍在 fields 里，无输入框时 fieldDisplayVal 兜底写 0）
 - [x] **移除 PDF 修正入口**（v3.2 / manifest v1.15.0 已实现）：Tab 剩 Excel 导入 + 商品库更新；删除 pdfState/renderPdfZone/processPdfFile/processPdfExcelFile/selectPdfMode/clearPdfData/resetPdfState/jumpPdfStep/previewPdfChanges/extractPdfTable/parsePdf；manifest 移除 pdf.min.js/pdf.worker.min.js 加载（lib 文件保留）；buildPdfPreviewModal 的 mode 兜底改 excelState.mode。语法通过，副本已同步，待 Chrome 冒烟
+- [x] **SKU 更新**（v3.3 + v3.4 / manifest v1.17.0 已实现）：两级匹配中 **UPC 匹配成功**（SKU 匹配失败）→ 用**转换 Excel 的 SKU**（pdf.catalog）更新 `product.packaging`——**SKU 列按入口区分**（单件=「订单行/包装/SKU」、套装=「订单行/包装/Box SKU」）；单件不识别规格定位 qty=1 记录写 `single_sku`、套装按套装数量（description xN）比对 "1 box of XX pieces" 写 `box_sku`；Modal SKU 列旧→新对照、变更默认勾选、失败文案拆 5 种、找不到规格跳过并提示；`matchPdfToExcel` pair 带 matchLevel（sku/upc）（详见 docs/PROJECT.md §6.5）
 - [ ] **Chrome 冒烟验证 v1.10.0**：两级匹配（同 UPC 多包装拆分命中/拆分失败缺货）、UPC+包装 Odoo 匹配（同 UPC 多包装精确命中/包装对不上报未找到）、双 Tab 切换、Excel 流、PDF 流回归
 - [ ] **Chrome 冒烟验证 v1.11.0**：product.product 页注入 + 默认商品库 Tab、`极牛产品名称-KVIVA(1).xlsx` 141 行解析、UPC 匹配、预览勾选、写回 name/brand
+- [ ] **Chrome 冒烟验证 v3.3**：UPC 匹配行 SKU 列旧→新对照展示、SKU 变更默认勾选、写回 single_sku（单件）/box_sku（套装）、找不到包装规格时橙色提示且订单行写回不受影响
 - [ ] `searchPoByName`/`searchPoByRef` 去重合并（低优先，保留无害）

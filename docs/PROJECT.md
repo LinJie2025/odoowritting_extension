@@ -1,7 +1,7 @@
 # Odoo Excel Importer — 项目文档
 
 > 本文件是项目的**权威文档**，与代码同步维护。任何 Agent 接任务前必须先读本文件。
-> 最后更新：2026-08-27（manifest v1.15.0，移除 PDF 修正入口，保留 Excel 导入 + 商品库更新）
+> 最后更新：2026-08-27（manifest v1.17.0，SKU 更新 v3.4：SKU 列按入口区分 单件=「订单行/包装/SKU」/套装=「订单行/包装/Box SKU」，单件不识别规格、套装保留 XX 比对）
 
 ---
 
@@ -15,7 +15,7 @@
 | 技术栈 | 纯原生 JS（**ES5 风格：`var` + IIFE + function 声明**），无框架、无构建步骤 |
 | 第三方库 | `lib/xlsx.full.min.js`（SheetJS）。~~`lib/pdf.min.js` + `lib/pdf.worker.min.js`（pdfjs-dist 3.11.174）~~ **v3.2 已移除**（PDF 修正入口删除，manifest 不再加载；lib 文件保留在仓库未删） |
 | 运行环境 | Odoo 实例的 `purchase.order` 页面 **或** `product.product`（产品变体）页面（URL hash 含对应 `model=`） |
-| 版本 | manifest v1.15.0 |
+| 版本 | manifest v1.17.0 |
 
 **核心价值**：人工核对采购数据 → 自动写回 Odoo 的「数量 / 包装数量 / 整箱批发价 / 备注」字段，避免逐行手工录入。
 
@@ -75,7 +75,9 @@ odoowritting_extension/
 | 键 | 表头名 | 用途 |
 |---|---|---|
 | `upc` | 订单行/产品/内部参考号 | 匹配键1（UPC） |
-| `catalog` | SKU_x | 匹配键2（Catalog）✅ 实测确认 |
+| `catalog` | SKU_x | 匹配键2（Catalog）✅ 实测确认（旧表头，v3.4 起仅作兜底） |
+| `catalogSingle` | 订单行/包装/SKU | **单件入口** SKU 列（v3.4，用户需求：单件 SKU 匹配用此列） |
+| `boxCatalog` | 订单行/包装/Box SKU | **套装入口** Box SKU 列（v3.4：套装 SKU 匹配用此列） |
 | `shop` | 订单行/店铺 | 多条区分 |
 | `qty` | 订单行/数量 | 总件数 |
 | `boxQty` | 包装数量 | 包装数量（v3.0 起；原「abw交货箱数」作废）→ product_packaging_qty，数量核对求和列 |
@@ -93,6 +95,7 @@ odoowritting_extension/
 - `PREFIX = "__odoi_"`：所有 DOM id / class / localStorage key 前缀
 - `LS_POS`：按钮位置 localStorage key；`LS_LOG`：最近日志 key
 - `PDF_MODES`：`single`（单件入口📦）/ `set`（套装入口🎁）
+- **`PACKAGING_ODOO_FIELDS`（v3.3）**：`product.packaging` 字段映射——`name`（包装规格，如 "piece"/"1 box of 42 pieces"）/ `qty`（包装件数，box 规格 = XX）/ `single_sku`（单件 SKU，piece 规格，标签「SKU」）/ `box_sku`（Box SKU，标签「Box SKU」），用户 2026-08-27 确认
 
 ---
 
@@ -299,6 +302,23 @@ odoowritting_extension/
 - **⚠️ Odoo 多语言翻译（2026-08-21 实测修复）**：`product.product.name` 是**多语言翻译字段**（translate），zh_CN 用户界面显示的是**简体中文翻译值**而非 source。扩展读/写 name **必须带 `context.lang="zh_CN"`**：读 → 预览旧值=界面实际显示值；写 → 覆盖中文翻译（source 已=Excel 值无需动）。不带 lang 会导致「数据库 source=Excel 但中文界面仍显示旧翻译」的假象。`brand` 无 translate 不受影响。**修复后需重跑一次全量更新覆盖 79 条已写入产品的中文翻译**
 - **样本实测（2026-08-21，openpyxl）**：`极牛产品名称-KVIVA(1).xlsx` → Sheet1 142 行（1 表头 + 141 数据）、3 列、无合并单元格、UPC 12/13 位混存（如 8809640734526 / 880933516775）、中文简称含换行
 
+### 6.5 SKU 更新流（manifest v1.17.0，2026-08-27 用户需求）
+
+> **用户需求（2026-08-27）**：两级匹配（SKU → UPC）中 **UPC 匹配成功**（SKU 匹配失败）的行 = 该商品 SKU 已变更，用**转换 Excel 的 SKU**（pdf.catalog）更新 Odoo 产品变体的商品包装规格 SKU 字段。**SKU 匹配成功的行不更新**（SKU 未变）。
+>
+> **v3.4（2026-08-27 用户澄清）**：① 单件规格**不需要识别**——入口（单件/套装）决定写 `single_sku` 还是 `box_sku`；② **采购单 Excel 的 SKU 列按入口区分**：单件入口 = 「订单行/包装/SKU」列、套装入口 = 「订单行/包装/Box SKU」列（两个采购单 Excel 同时含这两列且 Box SKU 在前，旧 fuzzy("SKU") 会误命中 Box SKU 列 → 单件 SKU 匹配失效）；③ **套装入口保留 XX 比对**（套装多规格，如 20/60/100 pieces）。
+
+- **Odoo 字段（`PACKAGING_ODOO_FIELDS`，用户确认）**：`product.packaging.name`（包装规格，如 "1 piece" / "1 box of 42 pieces"）、`single_sku`（单件 SKU，piece 规格）、`box_sku`（Box SKU，box 规格）
+- **SKU 列按入口区分（v3.4，`parseOrderExcel(data, mode)` + `colIdxCatalog`）**：单件 → `EXCEL_COLS.catalogSingle`（订单行/包装/SKU，fuzzy 兜底**跳过含 "Box" 的列**）；套装 → `EXCEL_COLS.boxCatalog`（订单行/包装/Box SKU）；旧表头「SKU_x」兼容兜底
+- **按入口写回**：
+  - 单件入口：`matchSkuPackaging` **不识别规格**，直接定位单件记录（**优先 qty=1 且 name 含 piece/each/single/unit → 其次任意 qty=1 → 再次仅 1 条记录兜底**），写回 `single_sku`（防误命中 box 规格 "1 box of XX pieces" 或库内 '1 piece' 但 qty≠1 的脏数据）
+  - 套装入口：套装数量 = `parseSetPieces`（description xN 优先 → 包装列 pieces 兜底，与数量公式同源），**比对 "1 box of XX pieces" 的 XX**（`parsePieces(name) === setPieces`），写回 `box_sku`
+- **匹配标记**：`matchPdfToExcel` pair 增加 `matchLevel`（`'sku'`/`'upc'`）；UPC 匹配（含拆分匹配）成功且转换 Excel catalog 有值 → changes 带 `skuUpdate {mode, newSku: pdf.catalog, setPieces}`
+- **查询**：`loadPackagingByUpc` 按 UPC=default_code 查 product.product → 其全部 product.packaging（id/name/qty/single_sku/box_sku），500/批分块；并入预览缓存 `previewLineCache.packMap`（与 lineData 同生命周期）
+- **预览 Modal**：SKU 列（宽 150px）展示「Odoo 原 SKU → 转换 Excel 新 SKU」两行对照（灰 → 紫），hover 提示写入的包装规格；SKU 有实际变更（old ≠ new）的行**默认勾选**；找不到包装规格 → SKU 橙色虚线下划线 + hover 原因（**跳过 SKU 更新，订单行写回不受影响**）
+- **失败文案（v3.4 拆分）**：`UPC 未匹配到产品（default_code 无对应）` / `该产品无包装规格记录（product.packaging）` / `未找到单件(piece)包装规格` / `未找到 N 件的 box 包装规格` / `套装数量提取失败，无法定位 box 规格`
+- **写回（`executePdfUpdate`）**：勾选行若 skuUpdate.ok 且 old ≠ new，额外 `product.packaging.write({single_sku | box_sku})`，**独立于订单行写回**（订单行 payload 为空但 SKU 变更的行也写）；任一侧失败计入 failed；日志 res.sku 记录 old → new + 规格名
+
 ---
 
 ## 7. UI 结构
@@ -372,6 +392,7 @@ odoowritting_extension/
 | 17 | 数量列改「包装数量」+ 价格原值改比对 Odoo（2026-08-26 用户需求） | `EXCEL_COLS.boxQty`/`applyPdfSingle`/`applyPdfSet`/`buildPreviewRows`/`getOrderLines`/`fieldOrder` | ⚠️ v3.0（manifest v1.13.0）已实现：数量比对与写回用采购单 Excel「包装数量」列（abw交货箱数列作废）；价格原值（单价→price_unit、0.9箱规价→box_wholesale_price、0.9总价→price_subtotal）从 Odoo 订单行取，buildPreviewRows 命中后回填重算 changed/reason；箱规价字段移除；缺货判断 = 包装数量空/0。语法通过，待 Chrome 冒烟验证 |
 | 18 | modal 按订单关联分组小计（2026-08-27 用户需求） | `renderPdfPreviewTable`（tbody 分组插行）/`renderPdfGroupSubtotalRow`（组小计行，只累计 total09）/`refreshTotal`（组小计实时刷新） | ⚠️ v3.1（manifest v1.14.0）已实现：套装入口每组尾部插「{订单关联号} 小计」行，只对 0.9总价列组内合计（全部行）；单件入口不插；全表合计行保留。语法通过，待 Chrome 冒烟验证 |
 | 19 | 移除 PDF 修正入口（2026-08-27 用户需求） | `renderTabSwitch`/`renderCardContent`/`renderExcelZone`/`excelState`（pdfState、renderPdfZone、processPdfFile、extractPdfTable、parsePdf 等已删） | ✅ v3.2（manifest v1.15.0）已实现：Tab 剩 Excel 导入 + 商品库更新；manifest 移除 pdf.min.js/pdf.worker.min.js 加载（lib 文件保留）；共享的 applyPdfByMode/匹配/预览/写回链路由 Excel 流独占。语法通过，副本已同步，待 Chrome 冒烟 |
+| 20 | SKU 更新（2026-08-27 用户需求） | `PACKAGING_ODOO_FIELDS`/`loadPackagingByUpc`/`matchSkuPackaging`/`matchPdfToExcel`（matchLevel）/`applyPdfSingle`/`applyPdfSet`（skuUpdate）/`parseOrderExcel`（colIdxCatalog 按入口定列）/`buildPreviewRows`/`renderPdfPreviewRow`（SKU 列对照）/`executePdfUpdate` | ⚠️ v3.3 + v3.4（manifest v1.17.0）已实现：UPC 匹配成功行用转换 Excel SKU 更新 product.packaging——单件入口写 single_sku（不识别规格，qty=1 定位；SKU 列=「订单行/包装/SKU」）、套装入口按套装数量比对 XX 写 box_sku（SKU 列=「订单行/包装/Box SKU」）；SKU 列旧→新对照，变更默认勾选；失败文案拆 5 种；找不到规格跳过并提示。语法通过，副本已同步，待 Chrome 冒烟验证 |
 
 ---
 
@@ -382,4 +403,5 @@ odoowritting_extension/
 3. **两级匹配（v2.0）**：PDF/转换版 Excel ↔ 采购单 Excel 先按 Catalog↔SKU 匹配，匹配不上的行走 UPC 匹配（同 UPC 多行用包装拆分：PDF 侧 description "(xN)"、Excel 侧包装列 pieces，拼成 `UPC+N` 精确配对；唯一 UPC 直接匹配）；数量核对按 matchKey（Catalog/UPC/拆分键）分组。**UPC+包装是 Odoo 匹配键（v1.9）**：Excel「内部参考号」+「订单行/包装」件数 ↔ Odoo `product.default_code` + `product_packaging_id.qty`；查 PO（=name）优先用「参考号」列、查不到再用「订单关联」列（v1.7.1）
 4. **无构建、无测试**：改完同步到 `odoowritting_extension/` 子目录后到 Chrome 手动验证
 5. **v3.0 比对基准**：数量 = 采购单 Excel「包装数量」列（求和 vs PDF Qty，写回 product_packaging_qty）；价格原值 = Odoo 订单行（price_unit / box_wholesale_price / price_subtotal），采购单 Excel 价格列不再作比对基准；箱规价字段已移除
-6. Git 提交必须过 commitlint（husky），格式 `type(scope): subject`
+6. **SKU 更新（v3.3）**：两级匹配中 UPC 匹配成功（SKU 匹配失败）→ 用转换 Excel SKU 更新 product.packaging——单件入口写 piece 规格的 `single_sku`；套装入口按套装数量（description xN）比对 "1 box of XX pieces" 写 `box_sku`；Modal SKU 列旧→新对照，变更默认勾选，找不到规格跳过并提示
+7. Git 提交必须过 commitlint（husky），格式 `type(scope): subject`
