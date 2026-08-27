@@ -49,6 +49,8 @@
 - [x] **PDF↔Excel 两级匹配重构**（v2.0 / manifest v1.10.0 已实现）：SKU 匹配不变 + UPC 包装拆分兜底（`extractDescPack` 提取 description `(xN)`、`extractPackQty` 提取包装列 pieces，拼 `UPC+N` 精确配对；唯一 UPC 直接匹配；拆分失败归缺货；数量核对按 matchKey 聚合），33 断言单测通过（详见 docs/PROJECT.md §6.2）
 - [x] **商品库更新 Tab**（v1.11.0 已实现）：UPC 定位产品变体（`default_code`），写回 `name`（中文简称）/`brand`（品牌，均 Char）；**不做新旧比对、空值也照写**（用户 2026-08-21 二次确认）；状态 ok/notfound/dup，未匹配注明原因，预览勾选写回（详见 docs/PROJECT.md §6.4）
 - [x] **数量列改「包装数量」+ 价格原值改比对 Odoo**（v3.0 / manifest v1.13.0 已实现）：数量比对与写回用采购单 Excel「包装数量」列（abw交货箱数列作废）；价格原值（单价→price_unit、0.9箱规价→box_wholesale_price、0.9总价→price_subtotal）从 Odoo 订单行取，`buildPreviewRows` 命中后回填重算 changed/reason；箱规价字段移除；缺货判断 = 包装数量空/0（详见 docs/PROJECT.md §6.2/#17）
+- [x] **modal 按订单关联分组小计**（v3.1 / manifest v1.14.0 已实现）：套装入口表格内每组尾部插「{订单关联号} 小计」行，只对 0.9总价列做组内合计（全部行），随编辑实时刷新；单件入口（无 total09）不插；底部全表合计行保留（详见 docs/PROJECT.md §6.2/#18）
+- [x] **modal 去掉整箱批发价列**（v3.1.1 / manifest v1.14.1 已实现）：fieldOrder/FIELD_LABELS/SUM_KEYS 移除 boxWholesale 列；**缺货行整箱批发价置 0 写回不受影响**（boxWholesale 字段仍在 fields 里，无输入框时 fieldDisplayVal 兜底写 0）
 - [ ] **Chrome 冒烟验证 v1.10.0**：两级匹配（同 UPC 多包装拆分命中/拆分失败缺货）、UPC+包装 Odoo 匹配（同 UPC 多包装精确命中/包装对不上报未找到）、双 Tab 切换、Excel 流、PDF 流回归
 - [ ] **Chrome 冒烟验证 v1.11.0**：product.product 页注入 + 默认商品库 Tab、`极牛产品名称-KVIVA(1).xlsx` 141 行解析、UPC 匹配、预览勾选、写回 name/brand
 - [ ] `searchPoByName`/`searchPoByRef` 去重合并（低优先，保留无害）

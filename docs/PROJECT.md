@@ -1,7 +1,7 @@
 # Odoo Excel Importer — 项目文档
 
 > 本文件是项目的**权威文档**，与代码同步维护。任何 Agent 接任务前必须先读本文件。
-> 最后更新：2026-08-26（manifest v1.13.0，数量列改「包装数量」+ 价格原值改比对 Odoo）
+> 最后更新：2026-08-27（manifest v1.14.1，modal 去掉整箱批发价列）
 
 ---
 
@@ -15,7 +15,7 @@
 | 技术栈 | 纯原生 JS（**ES5 风格：`var` + IIFE + function 声明**），无框架、无构建步骤 |
 | 第三方库 | `lib/xlsx.full.min.js`（SheetJS）、`lib/pdf.min.js` + `lib/pdf.worker.min.js`（pdfjs-dist **3.11.174 UMD 版**，4.x 起无 UMD 故锁定 3.x） |
 | 运行环境 | Odoo 实例的 `purchase.order` 页面 **或** `product.product`（产品变体）页面（URL hash 含对应 `model=`） |
-| 版本 | manifest v1.13.0 |
+| 版本 | manifest v1.14.1 |
 
 **核心价值**：人工核对采购数据 → 自动写回 Odoo 的「数量 / 包装数量 / 整箱批发价 / 备注」字段，避免逐行手工录入。
 
@@ -184,6 +184,7 @@ odoowritting_extension/
 > - 不一致字段为**可编辑输入框**，单元格内两行小字：PDF 来源计算值（如 `PDF: 50×0.9÷30 = 1.5`）+ Odoo 原值
 > - 悬浮不一致字段显示**原因气泡**（原因由 content.js 内置 `REASONS` 字典生成，v3.0 文案改「Odoo」）
 > - 表格底部**总和行**：所有数值列（包装数量/单价/0.9箱规价/0.9总价）全表合计，随编辑实时刷新
+> - **组小计（v3.1，2026-08-27 用户需求）**：套装入口按订单关联分组，每组尾部插一行「{订单关联号} 小计」，只累计 **0.9总价列**（全部行、不区分勾选），随编辑实时刷新；单件入口（无 total09 字段）不插组小计行；底部全表合计行保留
 
 ```
 步骤0 选修正入口（单件📦 / 套装🎁）
@@ -369,6 +370,7 @@ odoowritting_extension/
 | 15 | 商品库更新 Tab（UPC 定位产品变体，写回 name/brand） | `productState`/`renderProductZone`/`loadProductByUpc`/`executeProductUpdate` | ⚠️ v1.11.0 已实现（语法 + 状态判定单测通过），待 Chrome 冒烟验证（product.product 页注入、UPC 匹配、写回 name/brand） |
 | 16 | Excel 导入支持多个转换版文件（列表可删 + 合并去重） | `excelState.convFiles`/`mergeConvFiles`/`mergeCoupon`/`finishConvFiles`/`removeConvFile` | ⚠️ v1.12.0 已实现（17 断言单测通过），待 Chrome 冒烟验证（多文件添加/删除、同 UPC 同包装 Qty 相加、Coupon 任一非0、双流回归） |
 | 17 | 数量列改「包装数量」+ 价格原值改比对 Odoo（2026-08-26 用户需求） | `EXCEL_COLS.boxQty`/`applyPdfSingle`/`applyPdfSet`/`buildPreviewRows`/`getOrderLines`/`fieldOrder` | ⚠️ v3.0（manifest v1.13.0）已实现：数量比对与写回用采购单 Excel「包装数量」列（abw交货箱数列作废）；价格原值（单价→price_unit、0.9箱规价→box_wholesale_price、0.9总价→price_subtotal）从 Odoo 订单行取，buildPreviewRows 命中后回填重算 changed/reason；箱规价字段移除；缺货判断 = 包装数量空/0。语法通过，待 Chrome 冒烟验证 |
+| 18 | modal 按订单关联分组小计（2026-08-27 用户需求） | `renderPdfPreviewTable`（tbody 分组插行）/`renderPdfGroupSubtotalRow`（组小计行，只累计 total09）/`refreshTotal`（组小计实时刷新） | ⚠️ v3.1（manifest v1.14.0）已实现：套装入口每组尾部插「{订单关联号} 小计」行，只对 0.9总价列组内合计（全部行）；单件入口不插；全表合计行保留。语法通过，待 Chrome 冒烟验证 |
 
 ---
 
