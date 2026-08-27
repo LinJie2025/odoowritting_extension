@@ -2639,17 +2639,17 @@
   }
 
   // 字段展示顺序（按入口；2026-08-19 起 Excel 流与 PDF 流同一布局，source 仅保留兼容签名）
-  // v1.12.4：boxWholesale（缺货置 0 的整箱批发价，单件入口缺货行才有）排在备注前
   // v3.0：去掉箱规价（用户确认：Odoo 无对应字段，不再展示）
+  // v3.1.1：去掉整箱批发价列（用户确认 2026-08-27；缺货行 boxWholesale 字段仍保留在 fields 里，置 0 写回不受影响）
   function fieldOrder(mode, source) {
     var order = ["boxQty", "unitPrice"]
     if (mode === "set") order = order.concat(["boxPrice09", "total09"])
-    return order.concat(["boxWholesale", "remark"])
+    return order.concat(["remark"])
   }
 
   var FIELD_LABELS = {
     boxQty: "包装数量", boxPrice09: "0.9箱规价",
-    unitPrice: "单价", total09: "0.9总价", boxWholesale: "整箱批发价", remark: "备注"
+    unitPrice: "单价", total09: "0.9总价", remark: "备注"
   }
 
   function findField(fields, key) {
@@ -2782,13 +2782,30 @@
     }
 
     var tbody = document.createElement("tbody")
+    // v3.1（2026-08-27 用户需求）：按订单关联分组，每组尾部插一行「组小计」（只累计 0.9总价列）
+    // previewRows 已按 orderRef 排序（buildPreviewRows），同组行连续，遍历时组切换即插小计行
+    // 单件入口无 total09 字段（order 不含 total09）→ 不插组小计行
+    var groupCtx = []
+    var hasTotal09 = order.indexOf("total09") >= 0
     for (var i = 0; i < previewRows.length; i++) {
-      tbody.appendChild(renderPdfPreviewRow(previewRows[i], order, colMaxLen, i, source))
+      var pr = previewRows[i]
+      var curRef = String(pr.orderRef || "")
+      var lastGroup = groupCtx.length ? groupCtx[groupCtx.length - 1] : null
+      if (hasTotal09 && lastGroup && curRef !== lastGroup.ref) {
+        tbody.appendChild(renderPdfGroupSubtotalRow(lastGroup, order, source))
+      }
+      if (!lastGroup || curRef !== lastGroup.ref) {
+        groupCtx.push({ ref: curRef, rowIdx: [], cell: null })
+        lastGroup = groupCtx[groupCtx.length - 1]
+      }
+      lastGroup.rowIdx.push(i)
+      tbody.appendChild(renderPdfPreviewRow(pr, order, colMaxLen, i, source))
     }
+    if (hasTotal09 && groupCtx.length) tbody.appendChild(renderPdfGroupSubtotalRow(groupCtx[groupCtx.length - 1], order, source))
     table.appendChild(tbody)
 
     // 列总和行（2026-08-18 用户需求：所有数值列全表合计，随输入框编辑实时刷新）
-    table.appendChild(renderPdfTotalRow(previewRows, order, source))
+    table.appendChild(renderPdfTotalRow(previewRows, order, source, groupCtx))
 
     setTimeout(function () {
       var sa = document.getElementById(PREFIX + "pdf_select_all")
@@ -2803,6 +2820,37 @@
       }
     }, 10)
     return table
+  }
+
+  // 组小计行（v3.1，2026-08-27 用户需求）：按订单关联分组，只对 0.9总价（total09）列做组内合计
+  // 列结构与普通行对齐（勾选/店铺/UPC/SKU/订单关联/产品名 + [数量核对/供应商Qty] + 字段列），其余列占位
+  function renderPdfGroupSubtotalRow(group, order, source) {
+    var isExcel = source === "excel"
+    var tr = document.createElement("tr")
+    tr.style.cssText = "background:#f5f3ff;border-bottom:1px solid #e5e7eb"
+    tr.appendChild(el("td", { style: "padding:4px 8px" }))
+    for (var i = 0; i < 3; i++) tr.appendChild(el("td", { style: "padding:4px 8px" }))
+    var tdRef = el("td", {
+      style: "padding:4px 8px;font-size:11px;color:#6d28d9;font-weight:600;text-align:center;white-space:nowrap"
+    }, (group.ref || "—") + " 小计")
+    tr.appendChild(tdRef)
+    tr.appendChild(el("td", { style: "padding:4px 8px" }))
+    if (!isExcel) {
+      tr.appendChild(el("td", { style: "padding:4px 8px" }))
+      tr.appendChild(el("td", { style: "padding:4px 8px" }))
+    }
+    for (var o = 0; o < order.length; o++) {
+      var key = order[o]
+      if (key === "total09") {
+        group.cell = el("td", {
+          style: "padding:4px 8px;font-size:12px;color:#6d28d9;font-weight:600;text-align:center;white-space:nowrap"
+        }, "0")
+        tr.appendChild(group.cell)
+      } else {
+        tr.appendChild(el("td", { style: "padding:4px 8px;font-size:11px;color:#c4b5fd;text-align:center" }, "—"))
+      }
+    }
+    return tr
   }
 
   function renderPdfPreviewRow(row, order, colMaxLen, rowIndex, source) {
@@ -2956,7 +3004,7 @@
   }
 
   // ── 列总和行（2026-08-18：所有数值列全表合计，随输入框编辑实时刷新）──
-  var SUM_KEYS = { boxQty: 1, unitPrice: 1, boxPrice09: 1, total09: 1, boxWholesale: 1 }
+  var SUM_KEYS = { boxQty: 1, unitPrice: 1, boxPrice09: 1, total09: 1 }
   var pdfTotalCtx = null
 
   function refreshTotal() {
@@ -2992,9 +3040,24 @@
     for (var k2 in ctx.cells) {
       ctx.cells[k2].textContent = sums[k2] === undefined ? "0" : String(Math.round(sums[k2] * 1000) / 1000)
     }
+    // 组小计（v3.1，2026-08-27 用户需求）：按订单关联分组，只累计 0.9总价（total09），随编辑实时刷新
+    if (ctx.groups) {
+      for (var g = 0; g < ctx.groups.length; g++) {
+        var grp = ctx.groups[g]
+        if (!grp.cell) continue
+        var gsum = 0
+        for (var gi = 0; gi < grp.rowIdx.length; gi++) {
+          var gr = ctx.rows[grp.rowIdx[gi]]
+          if (!gr._inputs || !gr._inputs.total09) continue
+          var gn = parseFloat(gr._inputs.total09.value)
+          if (!isNaN(gn)) gsum += gn
+        }
+        grp.cell.textContent = String(Math.round(gsum * 1000) / 1000)
+      }
+    }
   }
 
-  function renderPdfTotalRow(previewRows, order, source) {
+  function renderPdfTotalRow(previewRows, order, source, groupCtx) {
     var isExcel = source === "excel"
     var tfoot = document.createElement("tfoot")
     var tr = document.createElement("tr")
@@ -3032,7 +3095,7 @@
     }
     if (pdfQtyCell) cells.pdfQty = pdfQtyCell
     tfoot.appendChild(tr)
-    pdfTotalCtx = { rows: previewRows, cells: cells }
+    pdfTotalCtx = { rows: previewRows, cells: cells, groups: groupCtx || [] }
     refreshTotal()
     return tfoot
   }
