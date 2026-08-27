@@ -30,9 +30,9 @@
     catalog: "SKU_x",                // 匹配键2（Catalog，真实表头名「SKU_x」）✅ 2026-08-17 实测确认
     shop: "订单行/店铺",
     qty: "订单行/数量",              // 总件数（无 HS CODE 时算箱数/箱规价用）
-    boxQty: "abw交货箱数",           // 交货箱数 → product_packaging_qty
+    boxQty: "包装数量",               // 包装数量（v3.0 用户确认：数量比对与写回改用此列，取代 abw交货箱数）→ product_packaging_qty
     pack: "订单行/包装",             // 取 "1 box of XX pieces" 的 XX（套装单件数量降级用 + v1.9 Odoo 包装匹配键）
-    boxPrice: "箱规价",              // 箱规价（套装源数据）
+    boxPrice: "箱规价",              // 箱规价（v3.0 起不再作比对基准，保留列定义兼容解析）
     boxPrice09: "0.9箱规价",         // 0.9箱规价 → box_wholesale_price
     total09: "0.9总价",              // 0.9总价（已取消比对，保留列定义）
     unitPrice: "单价",               // 单价 → price_unit
@@ -147,24 +147,23 @@
   }
 
   // 不一致原因字典（modal 悬浮展示，2026-08-18 用户需求）
+  // v3.0（2026-08-26）：数量列改「包装数量」；价格原值比对基准改 Odoo 订单行（Excel 列不再作基准）
   var REASONS = {
     qtySum: function (sum, target) {
-      return "数量不一致：abw交货箱数合计 " + fmtNum(sum) + " ≠ 供应商 Qty " + fmtNum(target)
+      return "数量不一致：包装数量合计 " + fmtNum(sum) + " ≠ 供应商 Qty " + fmtNum(target)
     },
     unitPrice: function (computed, expr, old) {
-      return "单价不一致：计算 " + expr + " = " + fmtNum(computed) + " ≠ Excel " + fmtNum(old)
-    },
-    boxPrice: function (up, old) {
-      return "箱规价不一致：PDF UNIT PRICE " + fmtNum(up) + " ≠ Excel " + fmtNum(old)
+      return "单价不一致：计算 " + expr + " = " + fmtNum(computed) + " ≠ Odoo " + fmtNum(old)
     },
     boxPrice09: function (computed, expr, old) {
-      return "0.9箱规价不一致：计算 " + expr + " = " + fmtNum(computed) + " ≠ Excel " + fmtNum(old)
+      return "0.9箱规价不一致：计算 " + expr + " = " + fmtNum(computed) + " ≠ Odoo " + fmtNum(old)
     },
     total09: function (computed, expr, old) {
-      return "0.9总价不一致：计算 " + expr + " = " + fmtNum(computed) + " ≠ Excel " + fmtNum(old)
+      return "0.9总价不一致：计算 " + expr + " = " + fmtNum(computed) + " ≠ Odoo " + fmtNum(old)
     },
-    boxQtyEmpty: "abw交货箱数为空或 0，标记缺货",
-    outstock: "Excel 有该 UPC/Catalog，但 PDF 中不存在"
+    boxQtyEmpty: "包装数量为空或 0，标记缺货",
+    outstock: "Excel 有该 UPC/Catalog，但 PDF 中不存在",
+    outstockZero: "缺货：单价与整箱批发价置为 0"
   }
 
   // 计算表达式展示（factor=1 时省略 ×1）
@@ -234,12 +233,13 @@
 
   // 批量取订单行（v1.9 匹配键改造：UPC = product.default_code，包装 = product.packaging 的 qty）
   // 一个 UPC 可能对应多个包装不同的品，需 UPC + 包装双重匹配（用户 2026-08-20 需求）
+  // v3.0：补读 price_subtotal（套装小计，价格比对原值用）
   async function getOrderLines(ids) {
     var result = await rpcCall("/web/dataset/call_kw/purchase.order.line/search_read", {
       model: "purchase.order.line", method: "search_read",
       args: [], kwargs: {
         domain: [["id", "in", ids]],
-        fields: ["id", "name", "price_unit", "box_wholesale_price", "remark", "product_packaging_qty", "product_id", "product_packaging_id"]
+        fields: ["id", "name", "price_unit", "box_wholesale_price", "price_subtotal", "remark", "product_packaging_qty", "product_id", "product_packaging_id"]
       }
     })
     var productIds = [], packIds = []
@@ -275,6 +275,7 @@
         packQty: (pk && pk.qty !== null && pk.qty !== undefined && pk.qty !== "") ? String(pk.qty) : "",
         packName: pk ? pk.name : "",
         price_unit: r.price_unit, box_wholesale_price: r.box_wholesale_price,
+        price_subtotal: r.price_subtotal,
         packaging_qty: r.product_packaging_qty,
         remark: r.remark || ""
       }
@@ -583,6 +584,8 @@
       partnerRef: colIdx(EXCEL_COLS.partnerRef)
     }
     if (idx.upc < 0) idx.upc = colIdxFuzzy(["内部参考号", "UPC", "EAN"])
+    // v3.0：包装数量列名变体兜底（用户确认表头「包装数量」；防带前缀/英文变体）
+    if (idx.boxQty < 0) idx.boxQty = colIdxFuzzy(["包装数量", "Packing Qty", "Packing", "包装数"])
     // v1.12.2：参考号模糊匹配必须排除「内部参考号」（UPC 列）——"内部参考号"含子串"参考号"，无「参考号」列时会误命中 UPC 列
     // 无「参考号」列 → partnerRef 为空 → loadOrderLineMap 直接用「订单关联」查 PO（用户 2026-08-25 确认）
     if (idx.partnerRef < 0) {
@@ -828,10 +831,11 @@
     return calcBoxPrice(n)
   }
 
-  // 数量核对：按 matchKey 分组求和 abw交货箱数，标记是否一致
+  // 数量核对：按 matchKey 分组求和包装数量（v3.0 起由 abw交货箱数列改为包装数量列），标记是否一致
   // v2.0：聚合键改用 pair.matchKey——SKU 匹配行 = Catalog；UPC 唯一匹配行 = UPC；拆分匹配行 = UPC+包装（不同包装独立核对）
   // v1.7.5：同一 SKU 拆多个订单关联/多个 UPC（如 A 关联 1 件 + B 关联 18 件 = 19 件）时合并求和 vs PDF Qty 总和
-  // v1.5（2026-08-18）：目标 = PDF Qty 原值，不区分格式、不再 ÷pieces（用户确认「abw交货箱数就是Qty列的数」）
+  // v1.5（2026-08-18）：目标 = PDF Qty 原值，不区分格式、不再 ÷pieces
+  // v3.0（2026-08-26）：求和列改为「包装数量」（用户确认数量比对与写回改用此列）
   function markQtyMismatch(pairs) {
     var byKey = {}
     for (var i = 0; i < pairs.length; i++) {
@@ -884,29 +888,39 @@
       var pair = m.pairs[i]
       var ex = pair.excel, p = pair.pdf
       var fields = []
-      var outstock = (ex.boxQty == null || ex.boxQty === 0)   // 缺货行：Excel 入口不写回价格
+      var outstock = (ex.boxQty == null || ex.boxQty === 0)   // 缺货行：包装数量为空/0（v3.0 由包装数量列驱动）
       // PDF 原始字段（悬浮提示第一行，2026-08-18 用户需求）
       var pdfRaw = ["UPC=" + p.upc, "QTY=" + p.qty, "UNIT PRICE=" + p.unitPrice, "Subtotal=" + p.subtotal].join(" | ")
-      // abw交货箱数（数量核对：可编辑，默认原值；数量不一致由 qtyMismatch 提示）
-      fields.push({ key: "boxQty", label: "abw交货箱数", odooField: ODOO_FIELDS.boxQty, oldValue: ex.boxQty, newValue: ex.boxQty, changed: false, pdfRaw: pdfRaw })
-      // abw交货箱数为空或 0 → 备注缺货
+      // 包装数量（数量核对：可编辑，默认原值；数量不一致由 qtyMismatch 提示）
+      fields.push({ key: "boxQty", label: "包装数量", odooField: ODOO_FIELDS.boxQty, oldValue: ex.boxQty, newValue: ex.boxQty, changed: false, pdfRaw: pdfRaw })
+      // 包装数量为空或 0 → 备注缺货
       if (outstock) {
         fields.push({ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: ex.remark || "", newValue: "缺货", changed: true, reason: REASONS.boxQtyEmpty, pdfRaw: pdfRaw })
       }
-      // 单价：PDF UNIT PRICE × factor vs Excel 单价列
+      // 单价：PDF UNIT PRICE × factor；原值/changed 由 Odoo price_unit 回填（v3.0，不再比对 Excel 单价列）
       var unit = parseFloatNum(p.unitPrice)
       var newUnit = applyFactor(unit, factor)
       var expr = unit !== null ? factorExpr(unit, factor) : null
-      var changed = newUnit !== null && !numEq(ex.unitPrice, newUnit)
       var unitField = {
         key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice,
-        oldValue: ex.unitPrice, newValue: newUnit, changed: changed,
+        oldValue: null, newValue: newUnit, changed: false, expr: expr,
         pdfSource: newUnit !== null ? "PDF: " + expr + " = " + newUnit : "",
-        reason: changed ? REASONS.unitPrice(newUnit, expr, ex.unitPrice) : null,
+        reason: null,
         pdfRaw: pdfRaw
       }
-      // Excel 入口缺货行：单价仅比对展示，不写回 Odoo
-      if (outstock && source === "excel") unitField.odooField = null
+      // v1.12.4（2026-08-26 用户需求）：缺货行（两入口统一）单价/整箱批发价置 0 写回，取代 v1.8.0 的 Excel 入口不写回
+      if (outstock) {
+        unitField.newValue = 0
+        unitField.changed = true
+        unitField.pdfSource = "缺货置 0"
+        unitField.reason = REASONS.outstockZero
+        // 单件入口无 0.9箱规价字段，追加整箱批发价置 0（Odoo 行有该字段则写 0）
+        fields.push({
+          key: "boxWholesale", label: "整箱批发价", odooField: ODOO_FIELDS.boxWholesalePrice,
+          oldValue: null, newValue: 0, changed: true,
+          pdfSource: "缺货置 0", reason: REASONS.outstockZero, pdfRaw: pdfRaw
+        })
+      }
       fields.push(unitField)
       changes.push({
         kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef, partnerRef: ex.partnerRef,
@@ -915,23 +929,28 @@
         fields: fields
       })
     }
-    // Excel 有但 PDF 无 → 缺货备注
+    // Excel 有但 PDF 无 → 缺货：备注 + 单价/整箱批发价置 0（v1.12.4 用户需求）
     for (var q = 0; q < m.outstock.length; q++) {
       var er = m.outstock[q]
       changes.push({
         kind: "outstock", upc: er.upc, catalog: er.catalog, shop: er.shop, orderRef: er.orderRef, partnerRef: er.partnerRef,
         packQty: extractPackQty(er.pack),
         qtyTarget: null, qtySum: null, qtyMismatch: false,
-        fields: [{ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock }]
+        fields: [
+          { key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock },
+          { key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice, oldValue: er.unitPrice, newValue: 0, changed: true, pdfSource: "缺货置 0", reason: REASONS.outstockZero },
+          { key: "boxWholesale", label: "整箱批发价", odooField: ODOO_FIELDS.boxWholesalePrice, oldValue: null, newValue: 0, changed: true, pdfSource: "缺货置 0", reason: REASONS.outstockZero }
+        ]
       })
     }
     return changes
   }
 
-  // ── 套装入口：统一公式（不区分 HS CODE）+ 4 项比对（2026-08-18 v1.5）──
-  // 箱规价=UNIT PRICE 原值；单价=UNIT PRICE×factor÷套装单件数量；0.9箱规价=UNIT PRICE×factor；0.9总价=Subtotal×factor
+  // ── 套装入口：统一公式（不区分 HS CODE）+ 3 项比对（v3.0 去掉箱规价，价格原值比对 Odoo）──
+  // 单价=UNIT PRICE×factor÷套装单件数量；0.9箱规价=UNIT PRICE×factor；0.9总价=Subtotal×factor
   // 套装单件数量：PDF PRODUCT DESCRIPTION 的 "x30" → 降级 Excel 包装列 pieces
-  // v1.8：Excel 入口（source='excel'）缺货行不写回单价/0.9箱规价（2026-08-19 用户需求）
+  // v3.0（2026-08-26）：箱规价字段移除；价格原值（oldValue/changed）由 Odoo 订单行回填（price_unit/box_wholesale_price/price_subtotal）
+  // v1.12.4：缺货行（两入口统一）单价/0.9箱规价置 0 写回
   function applyPdfSet(pdfRows, excelRows, factor, source) {
     var m = matchPdfToExcel(pdfRows, excelRows)
     markQtyMismatch(m.pairs)
@@ -940,7 +959,7 @@
       var pair = m.pairs[i]
       var ex = pair.excel, p = pair.pdf
       var fields = []
-      var outstock = (ex.boxQty == null || ex.boxQty === 0)   // 缺货行：Excel 入口不写回价格
+      var outstock = (ex.boxQty == null || ex.boxQty === 0)   // 缺货行：包装数量为空/0（v3.0 由包装数量列驱动）
       // 套装单件数量：PDF PRODUCT DESCRIPTION "x30" → 降级 Excel 包装列 pieces
       var pieces = parseSetPieces(p.description, ex.pack)
       var unit = parseFloatNum(p.unitPrice)
@@ -949,25 +968,15 @@
       var pdfRaw = ["UPC=" + p.upc, "QTY=" + p.qty, "UNIT PRICE=" + p.unitPrice, "Subtotal=" + p.subtotal].join(" | ")
       if (pieces && pieces > 0) pdfRaw += " | 套装单件数量=" + pieces
 
-      // abw交货箱数（数量核对：可编辑，默认原值；数量不一致由 qtyMismatch 提示）
-      fields.push({ key: "boxQty", label: "abw交货箱数", odooField: ODOO_FIELDS.boxQty, oldValue: ex.boxQty, newValue: ex.boxQty, changed: false, pdfRaw: pdfRaw })
-      // abw交货箱数为空或 0 → 备注缺货
+      // 包装数量（数量核对：可编辑，默认原值；数量不一致由 qtyMismatch 提示）
+      fields.push({ key: "boxQty", label: "包装数量", odooField: ODOO_FIELDS.boxQty, oldValue: ex.boxQty, newValue: ex.boxQty, changed: false, pdfRaw: pdfRaw })
+      // 包装数量为空或 0 → 备注缺货
       if (outstock) {
         fields.push({ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: ex.remark || "", newValue: "缺货", changed: true, reason: REASONS.boxQtyEmpty, pdfRaw: pdfRaw })
       }
+      // v3.0：箱规价字段已移除（用户确认：Odoo 无对应字段，不再展示）；价格原值改由 Odoo 回填
 
-      // 箱规价 = UNIT PRICE 原值（不写回）
-      var newBoxPrice = unit
-      var boxPriceChanged = newBoxPrice !== null && !numEq(ex.boxPrice, newBoxPrice)
-      fields.push({
-        key: "boxPrice", label: "箱规价", odooField: null,
-        oldValue: ex.boxPrice, newValue: newBoxPrice, changed: boxPriceChanged,
-        pdfSource: newBoxPrice !== null ? "PDF: UNIT PRICE " + newBoxPrice : "",
-        reason: boxPriceChanged ? REASONS.boxPrice(newBoxPrice, ex.boxPrice) : null,
-        pdfRaw: pdfRaw
-      })
-
-      // 单价 = UNIT PRICE × factor ÷ 套装单件数量 → price_unit
+      // 单价 = UNIT PRICE × factor ÷ 套装单件数量 → price_unit；原值由 Odoo price_unit 回填（v3.0）
       var newUnit = null, unitExpr = null
       if (unit !== null) {
         unitExpr = factorExpr(unit, factor) + (pieces && pieces > 0 ? "÷" + pieces : "")
@@ -975,40 +984,47 @@
         if (pieces && pieces > 0) newUnit = Math.round((newUnit / pieces) * 10000) / 10000
         else newUnit = null
       }
-      var unitChanged = newUnit !== null && !numEq(ex.unitPrice, newUnit)
       var unitField = {
         key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice,
-        oldValue: ex.unitPrice, newValue: newUnit, changed: unitChanged,
+        oldValue: null, newValue: newUnit, changed: false, expr: unitExpr,
         pdfSource: newUnit !== null ? "PDF: " + unitExpr + " = " + newUnit : "",
-        reason: unitChanged ? REASONS.unitPrice(newUnit, unitExpr, ex.unitPrice) : null,
+        reason: null,
         pdfRaw: pdfRaw
       }
-      // Excel 入口缺货行：单价仅比对展示，不写回 Odoo
-      if (outstock && source === "excel") unitField.odooField = null
+      // v1.12.4（2026-08-26 用户需求）：缺货行（两入口统一）单价置 0 写回，取代 v1.8.0 的 Excel 入口不写回
+      if (outstock) {
+        unitField.newValue = 0
+        unitField.changed = true
+        unitField.pdfSource = "缺货置 0"
+        unitField.reason = REASONS.outstockZero
+      }
       fields.push(unitField)
 
-      // 0.9箱规价 = UNIT PRICE × factor → box_wholesale_price
+      // 0.9箱规价 = UNIT PRICE × factor → box_wholesale_price；原值由 Odoo box_wholesale_price 回填（v3.0）
       var newBoxPrice09 = applyFactor(unit, factor)
-      var box09Changed = newBoxPrice09 !== null && !numEq(ex.boxPrice09, newBoxPrice09)
       var box09Field = {
         key: "boxPrice09", label: "0.9箱规价", odooField: ODOO_FIELDS.boxWholesalePrice,
-        oldValue: ex.boxPrice09, newValue: newBoxPrice09, changed: box09Changed,
+        oldValue: null, newValue: newBoxPrice09, changed: false, expr: factorExpr(unit, factor),
         pdfSource: newBoxPrice09 !== null ? "PDF: " + factorExpr(unit, factor) + " = " + newBoxPrice09 : "",
-        reason: box09Changed ? REASONS.boxPrice09(newBoxPrice09, factorExpr(unit, factor), ex.boxPrice09) : null,
+        reason: null,
         pdfRaw: pdfRaw
       }
-      // Excel 入口缺货行：0.9箱规价仅比对展示，不写回 Odoo
-      if (outstock && source === "excel") box09Field.odooField = null
+      // v1.12.4：缺货行 0.9箱规价置 0 写回（不再不写回）
+      if (outstock) {
+        box09Field.newValue = 0
+        box09Field.changed = true
+        box09Field.pdfSource = "缺货置 0"
+        box09Field.reason = REASONS.outstockZero
+      }
       fields.push(box09Field)
 
-      // 0.9总价 = Subtotal × factor（不写回，仅比对）
+      // 0.9总价 = Subtotal × factor（不写回，仅比对）；原值由 Odoo price_subtotal 回填（v3.0）
       var newTotal09 = applyFactor(sub, factor)
-      var total09Changed = newTotal09 !== null && !numEq(ex.total09, newTotal09)
       fields.push({
         key: "total09", label: "0.9总价", odooField: null,
-        oldValue: ex.total09, newValue: newTotal09, changed: total09Changed,
+        oldValue: null, newValue: newTotal09, changed: false, expr: factorExpr(sub, factor),
         pdfSource: newTotal09 !== null ? "PDF: " + factorExpr(sub, factor) + " = " + newTotal09 : "",
-        reason: total09Changed ? REASONS.total09(newTotal09, factorExpr(sub, factor), ex.total09) : null,
+        reason: null,
         pdfRaw: pdfRaw
       })
 
@@ -1019,14 +1035,18 @@
         fields: fields
       })
     }
-    // Excel 有但 PDF 无 → 缺货备注
+    // Excel 有但 PDF 无 → 缺货：备注 + 单价/整箱批发价置 0（v1.12.4 用户需求）
     for (var q = 0; q < m.outstock.length; q++) {
       var er = m.outstock[q]
       changes.push({
         kind: "outstock", upc: er.upc, catalog: er.catalog, shop: er.shop, orderRef: er.orderRef, partnerRef: er.partnerRef,
         packQty: extractPackQty(er.pack),
         qtyTarget: null, qtySum: null, qtyMismatch: false,
-        fields: [{ key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock }]
+        fields: [
+          { key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock },
+          { key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice, oldValue: er.unitPrice, newValue: 0, changed: true, pdfSource: "缺货置 0", reason: REASONS.outstockZero },
+          { key: "boxWholesale", label: "整箱批发价", odooField: ODOO_FIELDS.boxWholesalePrice, oldValue: null, newValue: 0, changed: true, pdfSource: "缺货置 0", reason: REASONS.outstockZero }
+        ]
       })
     }
     return changes
@@ -2554,6 +2574,23 @@
         if (cnt[k0] === 1) { line = lineMap[k0] || null; break }
         if (cnt[k0] > 1) break
       }
+      // v3.0（2026-08-26 用户需求）：价格原值从 Odoo 订单行取（单价→price_unit、0.9箱规价→box_wholesale_price、0.9总价→price_subtotal）
+      // 缺货行（kind=outstock）价格已定死（置 0），不参与回填
+      if (line && c.kind !== "outstock" && c.fields) {
+        var odooOldMap = { unitPrice: "price_unit", boxPrice09: "box_wholesale_price", total09: "price_subtotal" }
+        for (var fi = 0; fi < c.fields.length; fi++) {
+          var cf = c.fields[fi]
+          var odooKey = odooOldMap[cf.key]
+          if (!odooKey) continue
+          var oldVal = line[odooKey]
+          if (oldVal === null || oldVal === undefined || oldVal === "" || cf.newValue === null || cf.newValue === undefined) continue
+          cf.oldValue = oldVal
+          cf.changed = !numEq(oldVal, cf.newValue)
+          cf.reason = cf.changed ? (cf.key === "unitPrice" ? REASONS.unitPrice(cf.newValue, cf.expr, oldVal)
+            : cf.key === "boxPrice09" ? REASONS.boxPrice09(cf.newValue, cf.expr, oldVal)
+            : REASONS.total09(cf.newValue, cf.expr, oldVal)) : null
+        }
+      }
       var hasChanged = false
       for (var f = 0; f < c.fields.length; f++) { if (c.fields[f].changed) hasChanged = true }
       // v1.7.7：数据一致（白底无标记）的行也可勾选写入；仅「未找到匹配的订单行」不可勾选
@@ -2602,15 +2639,17 @@
   }
 
   // 字段展示顺序（按入口；2026-08-19 起 Excel 流与 PDF 流同一布局，source 仅保留兼容签名）
+  // v1.12.4：boxWholesale（缺货置 0 的整箱批发价，单件入口缺货行才有）排在备注前
+  // v3.0：去掉箱规价（用户确认：Odoo 无对应字段，不再展示）
   function fieldOrder(mode, source) {
     var order = ["boxQty", "unitPrice"]
-    if (mode === "set") order = order.concat(["boxPrice", "boxPrice09", "total09"])
-    return order.concat(["remark"])
+    if (mode === "set") order = order.concat(["boxPrice09", "total09"])
+    return order.concat(["boxWholesale", "remark"])
   }
 
   var FIELD_LABELS = {
-    boxQty: "abw交货箱数", boxPrice: "箱规价", boxPrice09: "0.9箱规价",
-    unitPrice: "单价", total09: "0.9总价", remark: "备注"
+    boxQty: "包装数量", boxPrice09: "0.9箱规价",
+    unitPrice: "单价", total09: "0.9总价", boxWholesale: "整箱批发价", remark: "备注"
   }
 
   function findField(fields, key) {
@@ -2797,7 +2836,7 @@
 
     // 数量核对 + PDF Qty 两列（仅 PDF 流；Excel 流无 PDF 源，2026-08-18）
     if (!isExcel) {
-      // 数量核对：PDF Qty vs abw交货箱数（多条求和）；一致 ✓ 绿色，不一致红色 + hover 原因
+      // 数量核对：PDF Qty vs 包装数量（多条求和）；一致 ✓ 绿色，不一致红色 + hover 原因
       var qtyTd = document.createElement("td")
       qtyTd.style.cssText = "padding:6px 8px;font-size:11px;text-align:center;vertical-align:middle;white-space:nowrap"
       if (row.kind === "outstock") {
@@ -2877,11 +2916,11 @@
         input.style.cssText = "width:calc(" + (w + 1) + "ch + 14px);padding:5px 6px;border:1px solid " + (changed ? "#fca5a5" : "#d1d5db") +
           ";border-radius:6px;font-size:12px;color:#111827;background:" + (changed ? "#fff5f5" : "#fff") +
           ";box-sizing:border-box;text-align:center"
-        // 输入框与 Excel 原值平级（同一行居中，2026-08-18：去掉 PDF 来源小字）
+        // 输入框与 Odoo 原值平级（同一行居中，2026-08-18：去掉 PDF 来源小字；v3.0：原值改 Odoo 值）
         var fieldRow = el("div", { style: "display:flex;align-items:center;justify-content:center;gap:8px;white-space:nowrap" })
         fieldRow.appendChild(input)
         if (changed && f.oldValue !== null && f.oldValue !== undefined && f.oldValue !== "") {
-          fieldRow.appendChild(el("span", { style: "font-size:10px;color:#9ca3af;text-decoration:line-through" }, "Excel 原值: " + fmtNum(f.oldValue)))
+          fieldRow.appendChild(el("span", { style: "font-size:10px;color:#9ca3af;text-decoration:line-through" }, "Odoo 原值: " + fmtNum(f.oldValue)))
         }
         ftd.appendChild(fieldRow)
         row._inputs[key] = input;
@@ -2917,7 +2956,7 @@
   }
 
   // ── 列总和行（2026-08-18：所有数值列全表合计，随输入框编辑实时刷新）──
-  var SUM_KEYS = { boxQty: 1, unitPrice: 1, boxPrice: 1, boxPrice09: 1, total09: 1 }
+  var SUM_KEYS = { boxQty: 1, unitPrice: 1, boxPrice09: 1, total09: 1, boxWholesale: 1 }
   var pdfTotalCtx = null
 
   function refreshTotal() {
