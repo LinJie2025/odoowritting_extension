@@ -1,5 +1,5 @@
 /**
- * Odoo Excel Importer v3.0
+ * Odoo Excel Importer v3.4
  *
  * 可拖动按钮 → 悬浮卡片(上传/标签/日志) → Modal(可最小化)
  */
@@ -28,6 +28,8 @@
   var EXCEL_COLS = {
     upc: "订单行/产品/内部参考号",   // 匹配键1（UPC）
     catalog: "SKU_x",                // 匹配键2（Catalog，真实表头名「SKU_x」）✅ 2026-08-17 实测确认
+    catalogSingle: "订单行/包装/SKU",  // 单件入口 SKU 列（v3.4，2026-08-27 用户需求：单件入口 SKU 匹配用此列）
+    boxCatalog: "订单行/包装/Box SKU", // 套装入口 Box SKU 列（v3.4：套装入口 SKU 匹配用此列）
     shop: "订单行/店铺",
     qty: "订单行/数量",              // 总件数（无 HS CODE 时算箱数/箱规价用）
     boxQty: "包装数量",               // 包装数量（v3.0 用户确认：数量比对与写回改用此列，取代 abw交货箱数）→ product_packaging_qty
@@ -53,6 +55,14 @@
     upc: "default_code",  // 定位键
     brand: "brand",       // 品牌（Char，直接写字符串）
     shortName: "name"     // 商品名称（中文）（Char）
+  }
+
+  // SKU 更新（v3.3，2026-08-27 用户需求）：Odoo product.packaging（商品包装规格）字段映射
+  var PACKAGING_ODOO_FIELDS = {
+    name: "name",             // 包装规格名称（如 "piece" / "1 box of 42 pieces"）
+    qty: "qty",               // 包装件数（box 规格 = XX）
+    singleSku: "single_sku",  // 单件 SKU（piece 规格，标签「SKU」）
+    boxSku: "box_sku"         // Box SKU（box 规格，标签「Box SKU」）
   }
 
   // ═══════════════════════════════════════════
@@ -297,7 +307,8 @@
   // ═══════════════════════════════════════════
 
   // 按列名解析采购订单 Excel（列顺序动态）
-  function parseOrderExcel(data) {
+  // v3.4（2026-08-27 用户需求）：SKU 列按入口区分——单件用「订单行/包装/SKU」，套装用「订单行/包装/Box SKU」
+  function parseOrderExcel(data, mode) {
     var wb = XLSX.read(data, { type: "array" })
     var ws = wb.Sheets[wb.SheetNames[0]]
     var rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true })
@@ -315,6 +326,28 @@
         }
       }
       return -1
+    }
+    // v3.4：SKU 列按入口定位——单件「订单行/包装/SKU」、套装「订单行/包装/Box SKU」
+    // 原因：两个采购单 Excel 同时含这两列且 Box SKU 在前，旧 fuzzy("SKU") 会先命中 Box SKU 列，
+    // 导致单件入口 SKU 匹配全部失效（单件商品被误推去 UPC 匹配）
+    function colIdxCatalog(header, mode) {
+      if (mode === "set") {
+        var b = header.indexOf(EXCEL_COLS.boxCatalog)
+        if (b >= 0) return b
+        b = colIdxFuzzy(["Box SKU", "BoxSKU", "Box/SKU"])
+        if (b >= 0) return b
+      } else if (mode === "single") {
+        var s = header.indexOf(EXCEL_COLS.catalogSingle)
+        if (s >= 0) return s
+        // 模糊兜底：跳过含 "Box" 的列（Box SKU 列在 SKU 列前面，防误命中）
+        for (var m = 0; m < header.length; m++) {
+          var h = header[m]
+          if (!h || h.indexOf("Box") !== -1) continue
+          if (h.indexOf("SKU") !== -1 || h.indexOf("Catalog") !== -1 || h.indexOf("货号") !== -1) return m
+        }
+      }
+      // 旧表头「SKU_x」及通用兜底（mode 未传时兼容）
+      return colIdxFuzzy(["包装/SKU", "SKU_x", "SKU", "Catalog", "货号"])
     }
     function cell(row, i) {
       if (i < 0) return ""
@@ -348,8 +381,8 @@
         if (prh.indexOf("参考号") !== -1 || /reference/i.test(prh)) { idx.partnerRef = prj; break }
       }
     }
-    // 「包装/SKU」优先于「Box SKU」——两者都含 "SKU"，若按含 SKU 兜底会先命中 Box SKU 列（2026-08-18 修复）
-    if (idx.catalog < 0) idx.catalog = colIdxFuzzy(["包装/SKU", "SKU_x", "SKU", "Catalog", "货号"])
+    // v3.4：SKU 列按入口区分（单件/套装），找不到再回退旧「SKU_x」+ 通用兜底
+    idx.catalog = colIdxCatalog(header, mode)
     if (idx.upc < 0) throw new Error("未找到 UPC 列（「" + EXCEL_COLS.upc + "」）")
 
     var result = []
@@ -497,6 +530,7 @@
     var matchedIdx = {}
 
     // ── 第一级：SKU 匹配（Excel 行 SKU 有值才参与；每个 Excel 行最多配对一次）──
+    // v3.3：pair 增加 matchLevel（'sku'/'upc'），UPC 匹配成功 = SKU 已变更，用于 SKU 更新写回
     var bySku = {}
     for (var i = 0; i < excelRows.length; i++) {
       var e = excelRows[i]
@@ -511,7 +545,7 @@
         var ex = skuHits[a]
         if (matchedIdx[ex.rowIndex]) continue
         matchedIdx[ex.rowIndex] = true
-        pairs.push({ excel: ex, pdf: p, matchKey: p.catalog })
+        pairs.push({ excel: ex, pdf: p, matchKey: p.catalog, matchLevel: "sku" })
       }
     }
 
@@ -555,7 +589,7 @@
         var ex2 = upcHits[b]
         if (matchedIdx[ex2.rowIndex]) continue
         matchedIdx[ex2.rowIndex] = true
-        pairs.push({ excel: ex2, pdf: pr, matchKey: pk })
+        pairs.push({ excel: ex2, pdf: pr, matchKey: pk, matchLevel: "upc" })
       }
     }
 
@@ -675,9 +709,15 @@
         })
       }
       fields.push(unitField)
+      // v3.3：UPC 匹配成功（SKU 匹配失败）→ SKU 已变更，用转换 Excel 的 SKU（pdf.catalog）更新 Odoo piece 规格的 single_sku
+      var skuUpd = null
+      if (pair.matchLevel === "upc" && p.catalog) {
+        skuUpd = { mode: "single", newSku: p.catalog, ok: null }
+      }
       changes.push({
         kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef, partnerRef: ex.partnerRef,
         packQty: extractPackQty(ex.pack),
+        skuUpdate: skuUpd,
         qtyTarget: pair.qtyTarget, qtySum: pair.qtySum, qtyMismatch: pair.qtyMismatch, qtyDetail: pair.qtyDetail,
         fields: fields
       })
@@ -688,6 +728,7 @@
       changes.push({
         kind: "outstock", upc: er.upc, catalog: er.catalog, shop: er.shop, orderRef: er.orderRef, partnerRef: er.partnerRef,
         packQty: extractPackQty(er.pack),
+        skuUpdate: null,
         qtyTarget: null, qtySum: null, qtyMismatch: false,
         fields: [
           { key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock },
@@ -781,9 +822,16 @@
         pdfRaw: pdfRaw
       })
 
+      // v3.3：UPC 匹配成功（SKU 匹配失败）→ SKU 已变更，用转换 Excel 的 SKU（pdf.catalog）更新 box 规格的 box_sku
+      // 套装数量 setPieces 用于比对 "1 box of XX pieces" 的 XX（与数量公式同源）
+      var skuUpd = null
+      if (pair.matchLevel === "upc" && p.catalog) {
+        skuUpd = { mode: "set", newSku: p.catalog, setPieces: pieces, ok: null }
+      }
       changes.push({
         kind: "match", upc: ex.upc, catalog: ex.catalog, shop: ex.shop, orderRef: ex.orderRef, partnerRef: ex.partnerRef,
         packQty: extractPackQty(ex.pack),
+        skuUpdate: skuUpd,
         qtyTarget: pair.qtyTarget, qtySum: pair.qtySum, qtyMismatch: pair.qtyMismatch, qtyDetail: pair.qtyDetail,
         fields: fields
       })
@@ -794,6 +842,7 @@
       changes.push({
         kind: "outstock", upc: er.upc, catalog: er.catalog, shop: er.shop, orderRef: er.orderRef, partnerRef: er.partnerRef,
         packQty: extractPackQty(er.pack),
+        skuUpdate: null,
         qtyTarget: null, qtySum: null, qtyMismatch: false,
         fields: [
           { key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock },
@@ -1496,6 +1545,49 @@
     return map
   }
 
+  // v3.3（2026-08-27 用户需求）：按 UPC（=default_code）批量查产品变体的全部商品包装规格（product.packaging）
+  // 返回 { upc: [{id, name, qty, singleSku, boxSku}] }——SKU 更新写回用（single_sku/box_sku 为 product.packaging 自定义字段）
+  async function loadPackagingByUpc(upcList) {
+    var result = await rpcCall("/web/dataset/call_kw/product.product/search_read", {
+      model: "product.product", method: "search_read",
+      args: [], kwargs: { domain: [["default_code", "in", upcList]], fields: ["id", "default_code"] }
+    })
+    var prodIds = [], codeById = {}
+    for (var i = 0; i < result.length; i++) {
+      var code = String(result[i].default_code || "").trim()
+      if (!code) continue
+      prodIds.push(result[i].id)
+      codeById[result[i].id] = code
+    }
+    var tmp = {}
+    for (var p = 0; p < prodIds.length; p++) tmp[prodIds[p]] = { code: codeById[prodIds[p]], packs: [] }
+    if (prodIds.length) {
+      var packs = await rpcCall("/web/dataset/call_kw/product.packaging/search_read", {
+        model: "product.packaging", method: "search_read",
+        args: [], kwargs: {
+          // ⚠️ 必须带 product_id（v3.4 修复：漏带会导致 pk.product_id 为 undefined，所有包装被跳过 → packMap 全空数组 → 误报「无包装规格记录」）
+          domain: [["product_id", "in", prodIds]],
+          fields: ["id", "name", "qty", "product_id", PACKAGING_ODOO_FIELDS.singleSku, PACKAGING_ODOO_FIELDS.boxSku]
+        }
+      })
+      for (var q = 0; q < packs.length; q++) {
+        var pk = packs[q]
+        var pid = (pk.product_id && pk.product_id.length) ? pk.product_id[0] : null
+        if (!pid || !tmp[pid]) continue
+        tmp[pid].packs.push({
+          id: pk.id, name: pk.name || "", qty: pk.qty,
+          singleSku: pk[PACKAGING_ODOO_FIELDS.singleSku] || "",
+          boxSku: pk[PACKAGING_ODOO_FIELDS.boxSku] || ""
+        })
+      }
+    }
+    var byCode = {}
+    for (var m in tmp) {
+      if (!byCode[tmp[m].code]) byCode[tmp[m].code] = tmp[m].packs
+    }
+    return byCode
+  }
+
   // 合并 Excel 行与 Odoo 匹配结果 → 预览行（状态：ok 将更新 / same 值相同 / notfound 未匹配 / dup UPC 重复）
   // 读取 Odoo 原 name/brand 与 Excel 比对展示（用户 2026-08-21 要求）；写回不做比对：匹配到唯一产品 → 直接更新（空值也照写）
   function buildProductPreviewRows(rows, map) {
@@ -1981,7 +2073,8 @@
     try {
       excelState.error = null
       var data = await file.arrayBuffer()
-      var excelRows = parseOrderExcel(data)
+      // v3.4：按入口解析 SKU 列（单件=「订单行/包装/SKU」、套装=「订单行/包装/Box SKU」）
+      var excelRows = parseOrderExcel(data, excelState.mode)
       if (!excelRows.length) {
         excelState.error = "采购订单 Excel 中没有有效数据"
         refreshCard()
@@ -2052,7 +2145,8 @@
 
   // 预览 Odoo 查询缓存（v1.12.3，2026-08-25 用户需求）：同一 changes 数组（引用相同）重复预览时
   // 复用已查的 lineData，不再重复请求 Odoo（Modal 关闭重开 / 反复点预览都不重查，直到数据重新生成）
-  var previewLineCache = { changes: null, lineData: null }
+  // v3.3：缓存扩展 packMap（product.packaging 查询），与 lineData 同生命周期
+  var previewLineCache = { changes: null, lineData: null, packMap: null }
 
   // 构建 PDF 区预览行（含 Odoo 订单行匹配；参考号/订单关联去重成 refPairs）
   async function buildPdfPreviewRows(changes) {
@@ -2065,22 +2159,66 @@
       seen[k] = true
       refPairs.push({ orderRef: c.orderRef || "", partnerRef: c.partnerRef || "" })
     }
-    var lineData
+    // v3.3：收集 SKU 更新行的 UPC（去重），批量查 product.packaging（500/批分块）
+    var skuUpcs = [], upcSeen = {}
+    for (var s = 0; s < changes.length; s++) {
+      var cu = changes[s]
+      if (cu.skuUpdate && cu.upc && !upcSeen[cu.upc]) {
+        upcSeen[cu.upc] = true
+        skuUpcs.push(cu.upc)
+      }
+    }
+    var lineData, packMap = {}
     if (previewLineCache.changes === changes && previewLineCache.lineData) {
       lineData = previewLineCache.lineData   // 缓存命中：不查 Odoo
+      packMap = previewLineCache.packMap || {}
     } else {
       lineData = await loadOrderLineMap(refPairs)
+      if (skuUpcs.length) {
+        for (var b = 0; b < skuUpcs.length; b += 500) {
+          var part = await loadPackagingByUpc(skuUpcs.slice(b, b + 500))
+          for (var kk in part) packMap[kk] = part[kk]
+        }
+      }
       previewLineCache.changes = changes
       previewLineCache.lineData = lineData
+      previewLineCache.packMap = packMap
     }
-    return buildPreviewRows(changes, lineData)
+    return buildPreviewRows(changes, lineData, packMap)
   }
 
-  // changes + lineData({map,cnt}) → 预览行（PDF/Excel 两流共用；lineData 已查好时直接走此函数）
+  // v3.3：匹配 SKU 更新的包装规格记录（product.packaging）
+  // v3.4（2026-08-27 用户需求）：单件入口不识别规格——入口已决定写 single_sku，直接定位 qty=1 的单件记录；
+  // 套装入口保留 XX 比对（套装多规格，如 20/60/100 pieces）：parsePieces(name) === setPieces（"1 box of XX pieces" 的 XX）
+  // 找不到 → null（SKU 不更新，仅提示）
+  function matchSkuPackaging(packs, mode, setPieces) {
+    if (!packs || !packs.length) return null
+    if (mode === "single") {
+      // 优先 qty=1 且 name 含单件关键词；其次任意 qty=1；再次仅 1 条记录兜底
+      // 防误命中：box 规格 "1 box of XX pieces" 也含 piece；库内存在 '1 piece' 但 qty≠1 的脏数据
+      for (var i = 0; i < packs.length; i++) {
+        if (String(packs[i].qty) === "1" && /piece|each|single|unit/i.test(packs[i].name)) return packs[i]
+      }
+      for (var j = 0; j < packs.length; j++) {
+        if (String(packs[j].qty) === "1") return packs[j]
+      }
+      if (packs.length === 1) return packs[0]
+      return null
+    }
+    if (setPieces === null || setPieces === undefined || setPieces === "") return null
+    var target = String(setPieces)
+    for (var k = 0; k < packs.length; k++) {
+      var n = parsePieces(packs[k].name)
+      if (n !== null && String(n) === target) return packs[k]
+    }
+    return null
+  }
+
+  // changes + lineData({map,cnt}) + packMap({upc: [product.packaging]}) → 预览行（PDF/Excel 两流共用；lineData 已查好时直接走此函数）
   // v1.9 匹配规则：UPC = Excel「内部参考号」↔ Odoo product.default_code；包装 = Excel「订单行/包装」件数 ↔ Odoo product_packaging.qty
   // - Excel 有包装件数 → 精确匹配 UPC+包装；失败且该 UPC 在 PO 中唯一 → 按 UPC 兜底；多行 → 报未找到（不降级到其他包装行，避免写错行）
   // - Excel 无包装件数 → 仅当该 UPC 在 PO 中唯一时按 UPC 命中；多行 → 报未找到
-  function buildPreviewRows(changes, lineData) {
+  function buildPreviewRows(changes, lineData, packMap) {
     var lineMap = lineData.map, cnt = lineData.cnt || {}
     var previewRows = []
     for (var k = 0; k < changes.length; k++) {
@@ -2119,6 +2257,28 @@
       }
       var hasChanged = false
       for (var f = 0; f < c.fields.length; f++) { if (c.fields[f].changed) hasChanged = true }
+      // v3.3：SKU 更新匹配包装规格（仅 UPC 匹配成功的行；SKU 匹配成功说明 SKU 未变，不更新）
+      // v3.4：区分「UPC 未匹配产品」与「产品无 packaging 记录」两种失败（排障用）
+      var skuUpd = c.skuUpdate || null
+      if (skuUpd) {
+        var hasUpc = !!(packMap && Object.prototype.hasOwnProperty.call(packMap, c.upc))
+        var packs = hasUpc ? packMap[c.upc] : null
+        var pkHit = hasUpc && packs.length ? matchSkuPackaging(packs, skuUpd.mode, skuUpd.setPieces) : null
+        if (pkHit) {
+          skuUpd.packagingId = pkHit.id
+          skuUpd.targetName = pkHit.name
+          skuUpd.oldSku = skuUpd.mode === "single" ? pkHit.singleSku : pkHit.boxSku
+          skuUpd.ok = true
+          skuUpd.error = ""
+        } else {
+          skuUpd.ok = false
+          skuUpd.error = !hasUpc ? "UPC 未匹配到产品（default_code 无对应）"
+            : !packs.length ? "该产品无包装规格记录（product.packaging）"
+            : skuUpd.mode === "single" ? "未找到单件(piece)包装规格"
+            : (skuUpd.setPieces ? "未找到 " + skuUpd.setPieces + " 件的 box 包装规格" : "套装数量提取失败，无法定位 box 规格")
+        }
+      }
+      var skuChanged = !!(skuUpd && skuUpd.ok && skuUpd.oldSku !== skuUpd.newSku)
       // v1.7.7：数据一致（白底无标记）的行也可勾选写入；仅「未找到匹配的订单行」不可勾选
       var lineErr = line ? null : "未找到匹配的订单行（UPC " + (c.upc || "—") + (c.packQty ? " / 包装 " + c.packQty + " 件" : "") + "）"
       previewRows.push({
@@ -2130,8 +2290,9 @@
         kind: c.kind,
         qtyTarget: c.qtyTarget, qtySum: c.qtySum, qtyMismatch: c.qtyMismatch, qtyDetail: c.qtyDetail,
         fields: c.fields,
+        skuUpdate: skuUpd,
         hasAction: !lineErr,
-        checked: hasChanged || c.kind === "outstock",
+        checked: hasChanged || c.kind === "outstock" || skuChanged,
         error: lineErr
       })
     }
@@ -2257,7 +2418,7 @@
       { w: "34px", html: '<input type="checkbox" id="' + PREFIX + 'pdf_select_all" checked style="cursor:pointer">' },
       { w: "80px", text: "店铺" },
       { w: "120px", text: "UPC" },
-      { w: "90px", text: "SKU" },
+      { w: "150px", text: "SKU" },   // v3.3：UPC 匹配成功的行显示旧→新对照（SKU 变更写回）
       { w: "90px", text: "订单关联" },
       { text: "产品名" }
     ]
@@ -2389,7 +2550,41 @@
 
     tr.appendChild(td(row.shop || "—", "#374151", "600"))
     tr.appendChild(td(row.upc, "#6b7280", null, "monospace;font-size:11px"))
-    tr.appendChild(td(row.catalog || "—", "#6b7280", null, "font-size:11px"))
+    // SKU 列（v3.3，2026-08-27 用户需求）：UPC 匹配成功（SKU 已变更）的行展示旧值 → 新值对照
+    // ok：两行小字（灰=Odoo 原 SKU，紫=转换 Excel 新 SKU）+ hover 提示写入的包装规格；变更时行默认勾选
+    // v3.4.1（2026-08-27 用户反馈）：old===new（值已一致）时补充「✓ 一致」标记 + hover 提示，避免只见灰色小字无说明
+    // 未找到包装规格：SKU 橙色虚线下划线 + hover 提示原因（跳过 SKU 更新，订单行写回不受影响）
+    if (row.skuUpdate && row.skuUpdate.ok) {
+      var su = row.skuUpdate
+      var skuTd = document.createElement("td")
+      skuTd.style.cssText = "padding:6px 8px;text-align:center;vertical-align:middle"
+      var oldSkuDiv = document.createElement("div")
+      oldSkuDiv.style.cssText = "font-size:11px;color:#9ca3af;word-break:break-all;max-width:160px"
+      oldSkuDiv.textContent = (su.oldSku === "") ? "—" : su.oldSku
+      skuTd.appendChild(oldSkuDiv)
+      if (su.oldSku !== su.newSku) {
+        var newSkuDiv = document.createElement("div")
+        newSkuDiv.style.cssText = "font-size:12px;color:#7c3aed;font-weight:600;word-break:break-all;max-width:160px;margin-top:2px"
+        newSkuDiv.textContent = su.newSku
+        skuTd.appendChild(newSkuDiv)
+        skuTd.title = "UPC 匹配成功，SKU 已变更 → 写入「" + su.targetName + "」规格的 SKU"
+      } else {
+        var okDiv = document.createElement("div")
+        okDiv.style.cssText = "font-size:11px;color:#059669;font-weight:600;margin-top:2px"
+        okDiv.textContent = "✓ 一致"
+        skuTd.appendChild(okDiv)
+        skuTd.title = "UPC 匹配成功，SKU 与转换 Excel 一致（" + su.newSku + "），无需更新"
+      }
+      tr.appendChild(skuTd)
+    } else if (row.skuUpdate && !row.skuUpdate.ok) {
+      var warnTd = td(row.catalog || "—", "#b45309", null, "font-size:11px")
+      warnTd.style.textDecoration = "underline dotted"
+      warnTd.style.cursor = "help"
+      warnTd.title = row.skuUpdate.error + "（SKU 不更新，订单行写回不受影响）"
+      tr.appendChild(warnTd)
+    } else {
+      tr.appendChild(td(row.catalog || "—", "#6b7280", null, "font-size:11px"))
+    }
     tr.appendChild(td(row.orderRef || "—", "#374151", null, "font-size:11px"))
     tr.appendChild(td(row.odooLineName || "—", row.error ? "#ef4444" : "#374151"))
 
@@ -2644,14 +2839,51 @@
           }
         }
       }
-      if (Object.keys(payload).length === 0) continue
-      try {
-        await updateOrderLine(row.odooLineId, payload)
-        logEntry.results.push({ upc: row.upc, shop: row.shop, orderRef: row.orderRef, status: "success", changes: changedDesc })
-      } catch (err) {
-        console.error("[Odoo PDF] 写回失败 lineId=" + row.odooLineId, err)
-        logEntry.results.push({ upc: row.upc, shop: row.shop, orderRef: row.orderRef, status: "failed", error: err.message || "写入失败", changes: changedDesc })
+      // v3.3：SKU 更新写回（UPC 匹配成功行的 single_sku / box_sku，独立于订单行写回）
+      var skuUpd = (row.skuUpdate && row.skuUpdate.ok && row.skuUpdate.packagingId) ? row.skuUpdate : null
+      var lineOk = Object.keys(payload).length > 0
+      var skuNeed = !!skuUpd
+      if (!lineOk && !skuNeed) continue
+      var lineStatus = "skipped", lineError = ""
+      if (lineOk) {
+        try {
+          await updateOrderLine(row.odooLineId, payload)
+          lineStatus = "success"
+        } catch (err) {
+          lineStatus = "failed"
+          lineError = err.message || "写入失败"
+          console.error("[Odoo PDF] 写回失败 lineId=" + row.odooLineId, err)
+        }
       }
+      var skuStatus = "skipped", skuError = "", skuDesc = ""
+      if (skuUpd) {
+        var skuPayload = {}
+        var skuField = skuUpd.mode === "single" ? PACKAGING_ODOO_FIELDS.singleSku : PACKAGING_ODOO_FIELDS.boxSku
+        skuPayload[skuField] = skuUpd.newSku
+        skuDesc = (skuUpd.mode === "single" ? "单件SKU" : "BoxSKU") + "=" + skuUpd.oldSku + "→" + skuUpd.newSku + "（" + skuUpd.targetName + "）"
+        if (skuUpd.oldSku === skuUpd.newSku) {
+          skuStatus = "skipped"   // 值相同无需写
+        } else {
+          try {
+            await rpcCall("/web/dataset/call_kw/product.packaging/write", {
+              model: "product.packaging", method: "write",
+              args: [[skuUpd.packagingId], skuPayload], kwargs: {}
+            })
+            skuStatus = "success"
+          } catch (err) {
+            skuStatus = "failed"
+            skuError = err.message || "写入失败"
+            console.error("[Odoo Excel Importer] SKU 写回失败 packagingId=" + skuUpd.packagingId, err)
+          }
+        }
+      }
+      var status = (lineStatus === "failed" || skuStatus === "failed") ? "failed"
+        : (lineStatus === "success" || skuStatus === "success") ? "success" : "skipped"
+      var errMsg = lineStatus === "failed" ? lineError : skuStatus === "failed" ? skuError : ""
+      var res = { upc: row.upc, shop: row.shop, orderRef: row.orderRef, status: status, changes: changedDesc }
+      if (skuDesc) res.sku = skuDesc
+      if (errMsg) res.error = errMsg
+      logEntry.results.push(res)
     }
 
     var skipped = previewRows.filter(function (r) { return !r.checked || !r.hasAction || r.error })
