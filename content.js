@@ -296,253 +296,6 @@
   //  PDF 解析 + 采购订单 Excel 解析 + 匹配修改
   // ═══════════════════════════════════════════
 
-  // 从文本块数组提取表格（列数动态，关键列按表头名识别；跨页累加；识别有无 HS CODE 两种格式）
-  function extractPdfTable(items) {
-    // 1. 表头行：含 UPC/EAN 关键字的文本块，最小 y（跨页时每页表头 x 坐标一致，取最小 y 即可）
-    var headerCandidates = items.filter(function (i) { return /UPC|EAN/i.test(i.text) })
-    if (!headerCandidates.length) {
-      throw new Error("未识别到表格表头（UPC/EAN）——请确认 PDF 为文本型而非扫描件")
-    }
-    var headerY = Math.min.apply(null, headerCandidates.map(function (i) { return i.y }))
-
-    // 2. 表头行所有文本块（y 容差 4），按 x0 排序
-    var headerRow = items.filter(function (i) { return Math.abs(i.y - headerY) <= 4 })
-      .sort(function (a, b) { return a.x0 - b.x0 })
-    if (!headerRow.length) {
-      throw new Error("表头行文本块提取失败")
-    }
-
-    // 3. 格式识别：表头是否含 HS CODE
-    var hasHsCode = false
-    for (var hh = 0; hh < headerRow.length; hh++) {
-      if (/HS\s*CODE/i.test(headerRow[hh].text)) { hasHsCode = true; break }
-    }
-
-    // 4. 列区间边界 = 相邻标题左边界中点
-    var bounds = []
-    for (var i = 0; i < headerRow.length - 1; i++) {
-      bounds.push((headerRow[i].x0 + headerRow[i + 1].x0) / 2)
-    }
-
-    // 5. 关键列索引（按表头名正则识别，两格式通用）
-    function findCol(re) {
-      for (var i = 0; i < headerRow.length; i++) if (re.test(headerRow[i].text)) return i
-      return -1
-    }
-    var upcCol = findCol(/UPC|EAN/i)
-    var catCol = findCol(/Catalog/i)
-    var qtyCol = findCol(/Qty/i)
-    var priceCol = findCol(/Unit\s*Price/i)
-    var subCol = findCol(/Subtotal/i)
-    var descCol = findCol(/Product\s*Description/i)   // 套装单件数量来源（"x30"）
-    if (upcCol < 0) {
-      throw new Error("表头中未找到 UPC/EAN 列")
-    }
-
-    // 6. x0 归属列
-    function colIndex(x0) {
-      for (var i = 0; i < headerRow.length; i++) {
-        var lo = i > 0 ? bounds[i - 1] : -Infinity
-        var hi = i < bounds.length ? bounds[i] : Infinity
-        if (x0 >= lo && x0 < hi) return i
-      }
-      return headerRow.length - 1
-    }
-
-    // 7. 数据行锚点：UPC 列内的 8~14 位纯数字块（跨页累加所有页）
-    var digitRe = /^\d{8,14}$/
-    var anchors = items.filter(function (i) {
-      return digitRe.test(i.text) && i.y > headerY + 10 && colIndex(i.x0) === upcCol
-    }).sort(function (a, b) { return a.y - b.y })
-    if (!anchors.length) {
-      throw new Error("表头已识别，但未找到 UPC 数据行（UPC 需为 8~14 位纯数字）")
-    }
-
-    // 8. 行聚类（B：行高自适应，2026-08-18）
-    //    行高 = 相邻锚点 y 间距（跨页/异常间距 >120 时沿用上一行高）；
-    //    归属范围 = [a.y - max(8, h*0.4), a.y + h*0.8] —— 下行覆盖 desc 折行，上行防串入上一行 desc 第二行
-    var numishRe = /^[\d\s.,+-]+$/
-    var heights = []
-    for (var ha = 0; ha < anchors.length; ha++) {
-      var hh = ha + 1 < anchors.length ? anchors[ha + 1].y - anchors[ha].y : -1
-      if (hh < 8 || hh > 120) hh = heights.length ? heights[heights.length - 1] : 30
-      heights.push(hh)
-    }
-    var dataRows = []   // 通过假行过滤的 { cells }（粗分：标题中点边界）
-    for (var ai = 0; ai < anchors.length; ai++) {
-      var a = anchors[ai]
-      var h = heights[ai]
-      var rowItems = items.filter(function (i) {
-        return i.y > headerY && i.y >= a.y - Math.max(8, h * 0.4) && i.y <= a.y + h * 0.8
-      })
-      var cells = {}
-      for (var ri = 0; ri < rowItems.length; ri++) {
-        var it = rowItems[ri]
-        var ci = colIndex(it.x0)
-        if (!cells[ci]) cells[ci] = []
-        cells[ci].push(it)
-      }
-      var row = {}
-      for (var ci2 in cells) {
-        cells[ci2].sort(function (x, y) { return x.y - y.y })
-        row[ci2] = cells[ci2].map(function (x) { return x.text }).join(" ")
-      }
-      // 假行过滤：页脚/客户信息文本落入 UPC 列（如 'Phone: 18922477200'）时行内无数据列字段，跳过
-      if (!(row[catCol] || row[qtyCol] || row[priceCol] || row[subCol])) continue
-      dataRows.push({ cells: cells })
-    }
-
-    // 9. 列边界校准（A：内容聚类，2026-08-18）
-    //    表头位置随对齐方式漂移（居中/右对齐），内容位置才是真实列边界。
-    //    列边界 = 相邻两列「内容范围」的间隙中点；空列/内容重叠时用标题中点兜底。
-    var colBlocks = []
-    for (var cb = 0; cb < headerRow.length; cb++) colBlocks.push([])
-    for (var dr = 0; dr < dataRows.length; dr++) {
-      var drc = dataRows[dr].cells
-      for (var dc in drc) {
-        var dcNum = parseInt(dc, 10)
-        for (var dbi = 0; dbi < drc[dc].length; dbi++) colBlocks[dcNum].push(drc[dc][dbi])
-      }
-    }
-    // desc 列粗分为空（标题与内容错位时 desc 被粗分进相邻列）→ 从相邻列摘除「含字母」块补入 desc 列
-    if (descCol >= 0 && colBlocks[descCol].length === 0) {
-      for (var si = -1; si <= 1; si += 2) {
-        var sCol = descCol + si
-        if (sCol < 0 || sCol >= colBlocks.length) continue
-        var kept = []
-        for (var sb = 0; sb < colBlocks[sCol].length; sb++) {
-          var sblk = colBlocks[sCol][sb]
-          if (/[A-Za-z]/.test(sblk.text) && !numishRe.test(sblk.text)) colBlocks[descCol].push(sblk)
-          else kept.push(sblk)
-        }
-        colBlocks[sCol] = kept
-      }
-    }
-    var colRange = []
-    for (var cr = 0; cr < colBlocks.length; cr++) {
-      var minX0 = Infinity, maxX1 = -Infinity
-      for (var cbi = 0; cbi < colBlocks[cr].length; cbi++) {
-        var blk = colBlocks[cr][cbi]
-        if (blk.x0 < minX0) minX0 = blk.x0
-        if (blk.x1 > maxX1) maxX1 = blk.x1
-      }
-      colRange.push({ minX0: minX0, maxX1: maxX1, empty: colBlocks[cr].length === 0 })
-    }
-    var newBounds = []
-    for (var nb = 0; nb < bounds.length; nb++) {
-      var lo = colRange[nb].empty ? bounds[nb] : colRange[nb].maxX1
-      var hi = colRange[nb + 1].empty ? bounds[nb] : colRange[nb + 1].minX0
-      newBounds.push(lo < hi ? (lo + hi) / 2 : bounds[nb])
-    }
-    function colIndex2(x0) {
-      for (var i = 0; i < headerRow.length; i++) {
-        var lo = i > 0 ? newBounds[i - 1] : -Infinity
-        var hi = i < newBounds.length ? newBounds[i] : Infinity
-        if (x0 >= lo && x0 < hi) return i
-      }
-      return headerRow.length - 1
-    }
-
-    // 10. 按新列边界重新归属
-    var rows = []
-    for (var rr = 0; rr < dataRows.length; rr++) {
-      var src = dataRows[rr].cells
-      var cells2 = {}
-      for (var sc in src) {
-        for (var sbi = 0; sbi < src[sc].length; sbi++) {
-          var blk2 = src[sc][sbi]
-          var ci2b = colIndex2(blk2.x0)
-          if (!cells2[ci2b]) cells2[ci2b] = []
-          cells2[ci2b].push(blk2)
-        }
-      }
-      var row2 = {}
-      for (var ci4 in cells2) {
-        cells2[ci4].sort(function (x, y) { return x.y - y.y })
-        row2[ci4] = cells2[ci4].map(function (x) { return x.text }).join(" ")
-      }
-      // desc 兜底（保险）：重新归属后 desc 列仍空时，从相邻列逐块取含字母文本合并
-      var descText = (row2[descCol] || "").trim()
-      if (!descText && descCol >= 0) {
-        var parts = []
-        for (var ci5 in row2) {
-          var cnum = parseInt(ci5, 10)
-          if (cnum === descCol || Math.abs(cnum - descCol) > 1) continue
-          var blocks = cells2[ci5] || []
-          for (var bi2 = 0; bi2 < blocks.length; bi2++) {
-            var bt = blocks[bi2].text
-            if (/[A-Za-z]/.test(bt) && !numishRe.test(bt)) parts.push(bt)
-          }
-        }
-        descText = parts.join(" ")
-      }
-      row2.__desc = descText
-      rows.push(row2)
-    }
-
-    // 11. 输出：格式 + Coupon + 关键列
-    return {
-      format: hasHsCode ? "B" : "A",
-      coupon: extractCoupon(items),
-      rows: rows.map(function (r) {
-        return {
-          upc: (r[upcCol] || "").trim(),
-          catalog: (r[catCol] || "").trim(),
-          qty: (r[qtyCol] || "").trim(),
-          unitPrice: (r[priceCol] || "").trim(),
-          subtotal: (r[subCol] || "").trim(),
-          description: r.__desc || ""
-        }
-      })
-    }
-  }
-
-  // 从汇总区提取 Coupon 值（决定是否 ×0.9）
-  function extractCoupon(items) {
-    var blocks = items.filter(function (i) { return /^Coupon$/i.test(i.text) })
-    if (!blocks.length) return 0
-    var c = blocks[0]
-    var cands = items.filter(function (i) {
-      return Math.abs(i.y - c.y) <= 5 && i.x0 > c.x0 && /^-?\d/.test(i.text)
-    }).sort(function (a, b) { return a.x0 - b.x0 })
-    if (!cands.length) return 0
-    var v = parseFloat(cands[0].text.replace(/[^\d.-]/g, ""))
-    return isNaN(v) ? 0 : v
-  }
-
-  // 用 pdfjs-dist 解析 PDF → 文本块 → 表格
-  async function parsePdf(arrayBuffer) {
-    if (typeof pdfjsLib === "undefined") throw new Error("PDF 解析库未加载")
-    try {
-      if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL) {
-        pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js")
-      }
-    } catch (e) {}
-    var task = pdfjsLib.getDocument({ data: arrayBuffer, isEvalSupported: false })
-    var pdf = await task.promise
-    var items = []
-    try {
-      for (var p = 1; p <= pdf.numPages; p++) {
-        var page = await pdf.getPage(p)
-        var viewport = page.getViewport({ scale: 1 })
-        var content = await page.getTextContent()
-        for (var i = 0; i < content.items.length; i++) {
-          var it = content.items[i]
-          var str = (it.str || "").trim()
-          if (!str) continue
-          var vp = viewport.convertToViewportPoint(it.transform[4], it.transform[5])
-          // x1 = 文本右边缘（内容聚类列边界用；pdfjs width 为文本空间宽度，加 transform[4] 即右边缘 x）
-          var vp1 = viewport.convertToViewportPoint(it.transform[4] + (it.width || 0), it.transform[5])
-          // 页偏移：多页时各页 y 从 0 起，加 (page-1)*1000 使全局 y 单调递增，避免跨页坐标重叠
-          items.push({ text: str, x0: vp[0], x1: vp1[0], y: vp[1] + (p - 1) * 1000, page: p })
-        }
-      }
-    } finally {
-      pdf.destroy()
-    }
-    return extractPdfTable(items)
-  }
-
   // 按列名解析采购订单 Excel（列顺序动态）
   function parseOrderExcel(data) {
     var wb = XLSX.read(data, { type: "array" })
@@ -625,7 +378,7 @@
     return result
   }
 
-  // 解析「PDF 转换版 Excel」（2026-08-19 Excel 入口改造：输出与 extractPdfTable 同构，供 applyPdfByMode 复用）
+  // 解析「PDF 转换版 Excel」（2026-08-19 Excel 入口改造：输出与 PDF 表格同构，供 applyPdfByMode 复用）
   // 表头行 = 首个含 UPC/EAN 关键字的行；格式按表头有无 HS CODE 分 A/B；列按表头名正则定位（容忍空列/用户附加列）；
   // 数据行 = UPC 列为 8~14 位纯数字的行（汇总区/说明文字自然跳过）；Coupon 从汇总区单独提取（决定 ×0.9）
   function parseConvertedPdfExcel(data) {
@@ -1052,7 +805,7 @@
     return changes
   }
 
-  // ── 入口分发：按 PDF 修正入口路由到对应处理逻辑 ──
+  // ── 入口分发：按修正入口（单件/套装）路由到对应处理逻辑 ──
   // source: 'pdf' | 'excel'（v1.8：Excel 流缺货行不写回单价/整箱批发价）
   function applyPdfByMode(pdfRows, excelRows, mode, coupon, source) {
     var factor = (coupon === 0 || coupon === null || coupon === undefined) ? 1 : 0.9
@@ -1099,26 +852,13 @@
   // ═══════════════════════════════════════════
   var appState = {
     cardOpen: false,
-    activeTab: isProductPage() ? "product" : "excel"   // 'excel' | 'pdf' | 'product'（商品库更新，v1.11.0；产品页默认商品库 Tab）
+    activeTab: isProductPage() ? "product" : "excel"   // 'excel' | 'product'（商品库更新，v1.11.0；产品页默认商品库 Tab）
   }
 
-  // PDF 修正入口模式（单件 / 套装，处理逻辑区分）
+  // 修正入口模式（单件 / 套装，处理逻辑区分；Excel 导入流用）
   var PDF_MODES = {
     single: { id: "single", label: "单件入口", icon: "📦", desc: "按单件 UPC 匹配修正" },
     set:    { id: "set",    label: "套装入口", icon: "🎁", desc: "按套装组合匹配修正" }
-  }
-
-  // PDF 区流程状态
-  var pdfState = {
-    mode: null,          // 修正入口: null | 'single' | 'set'
-    pdfRows: null,       // PDF 解析出的表格数据行 [{upc,catalog,qty,unitPrice,subtotal}]
-    pdfFileName: null,
-    pdfFormat: null,     // PDF 格式: 'A'(无HS CODE) | 'B'(有HS CODE)
-    coupon: 0,           // 汇总区 Coupon 值（决定是否 ×0.9）
-    excelRows: null,     // 采购订单 Excel 解析结果
-    excelFileName: null,
-    changes: null,       // 匹配修改结果（每条带 mode 标记）
-    error: null          // 当前步骤错误信息（常驻显示，下次成功时清除）
   }
 
   // Excel 导入区流程状态（2026-08-19 改造：上传「PDF 转换版 Excel」→ 再传采购订单 Excel → 与 PDF 流同逻辑比对写回）
@@ -1245,7 +985,7 @@
       btn.style.cursor = "grab"
       btn.textContent = "📥"
       var file = e.dataTransfer.files[0]
-      if (file) showToast("请在卡片内选择入口上传文件（📊 Excel 导入 / 📄 PDF 修正 / 🏷 商品库更新）", "info")
+      if (file) showToast("请在卡片内选择入口上传文件（📊 Excel 导入 / 🏷 商品库更新）", "info")
     })
 
     return btn
@@ -1363,10 +1103,10 @@
     var tab = appState.activeTab
     var isExcelTab = tab === "excel"
     var isProductTab = tab === "product"
-    // 标题：商品库更新 / Excel 导入 / PDF 修正（含当前入口徽章，商品库无入口概念）
-    var titleText = isProductTab ? "商品库更新" : (isExcelTab ? "Excel 导入" : "PDF 修正")
-    if (!isProductTab && (isExcelTab ? excelState.mode : pdfState.mode)) {
-      var m = PDF_MODES[isExcelTab ? excelState.mode : pdfState.mode]
+    // 标题：商品库更新 / Excel 导入（含当前入口徽章，商品库无入口概念）
+    var titleText = isProductTab ? "商品库更新" : "Excel 导入"
+    if (!isProductTab && excelState.mode) {
+      var m = PDF_MODES[excelState.mode]
       titleText += " · " + m.label
     }
 
@@ -1384,14 +1124,13 @@
       }, "✕")
     ]))
 
-    // Tab 栏：📊 Excel 导入 / 📄 PDF 修正 / 🏷 商品库更新（v1.11.0）
+    // Tab 栏：📊 Excel 导入 / 🏷 商品库更新（v1.11.0；v3.2 去掉 PDF 修正）
     frag.appendChild(renderTabSwitch())
 
     // 内容区（按 Tab 路由）+ 日志区（v1.12.1：包可滚动容器 flex:1，文件列表超出卡片高度时内容区出现滚动条，Header/Tab 固定）
     var bodyWrap = el("div", { style: "flex:1;overflow-y:auto;min-height:0;padding-bottom:10px" })
     if (isExcelTab) bodyWrap.appendChild(renderExcelZone())
-    else if (isProductTab) bodyWrap.appendChild(renderProductZone())
-    else bodyWrap.appendChild(renderPdfZone())
+    else bodyWrap.appendChild(renderProductZone())
 
     // 日志区 (有日志才显示)
     var log = getLog()
@@ -1407,17 +1146,12 @@
   }
 
   // ═══════════════════════════════════════════
-  //  3. 上传区（Excel 导入 Tab 已移除，只保留 PDF 修正入口）
-  // ═══════════════════════════════════════════
-
-  // ═══════════════════════════════════════════
-  //  3. Tab 栏（📊 Excel 导入 / 📄 PDF 修正，2026-08-18 恢复双 Tab）
+  //  3. Tab 栏（📊 Excel 导入 / 🏷 商品库更新，2026-08-18 双 Tab；v3.2 去掉 PDF 修正）
   // ═══════════════════════════════════════════
   function renderTabSwitch() {
     var bar = el("div", { style: "display:flex;padding:10px 16px 0;gap:8px" })
     var tabs = [
       { id: "excel", label: "📊 Excel 导入" },
-      { id: "pdf", label: "📄 PDF 修正" },
       { id: "product", label: "🏷 商品库更新" }
     ]
     for (var i = 0; i < tabs.length; i++) {
@@ -1432,107 +1166,6 @@
       })(tabs[i])
     }
     return bar
-  }
-
-  // ═══════════════════════════════════════════
-  //  3b. PDF 区 UI
-  // ═══════════════════════════════════════════
-
-
-  function renderPdfZone() {
-    var wrap = el("div", { style: "margin:12px 16px;display:flex;flex-direction:column;gap:10px" })
-
-    // 当前入口徽章（可切换）
-    if (pdfState.mode) {
-      var m = PDF_MODES[pdfState.mode]
-      wrap.appendChild(el("div", {
-        style: "display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#7c3aed;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px;padding:8px 10px"
-      }, [
-        el("span", {}, m.icon + " 当前入口：" + m.label),
-        el("span", {
-          onclick: function () { resetPdfState() },
-          style: "cursor:pointer;text-decoration:underline;color:#6b7280"
-        }, "切换入口")
-      ]))
-    }
-
-    // 常驻错误提示（解析失败原因，成功后自动清除）
-    if (pdfState.error) {
-      wrap.appendChild(el("div", {
-        style: "font-size:12px;color:#dc2626;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:8px 10px;line-height:1.5"
-      }, "⚠️ " + pdfState.error))
-    }
-
-    // 步骤指示器：① 上传 PDF → ② 上传 Excel → ③ 预览确认（已完成步骤可点击回退，防误上传）
-    if (pdfState.mode) {
-      var step = pdfState.pdfRows ? (pdfState.excelRows ? 3 : 2) : 1
-      var steps = [
-        { n: 1, label: "上传 PDF", icon: "📄" },
-        { n: 2, label: "上传 Excel", icon: "📊" },
-        { n: 3, label: "预览确认", icon: "👁" }
-      ]
-      var stepBar = el("div", { style: "display:flex;align-items:center;gap:6px;font-size:11px" })
-      for (var si = 0; si < steps.length; si++) {
-        (function (s) {
-          var done = s.n < step, active = s.n === step
-          var clickable = done   // 仅已完成步骤可点击回退
-          var chipStyle = "flex:1;text-align:center;padding:6px 4px;border-radius:6px;border:1px solid " +
-            (active ? "#7c3aed" : (done ? "#a7f3d0" : "#e5e7eb")) + ";background:" +
-            (active ? "#f5f3ff" : (done ? "#f0fdf4" : "#f9fafb")) + ";color:" +
-            (active ? "#7c3aed" : (done ? "#059669" : "#9ca3af")) + ";font-weight:" + (active ? "600" : "400") +
-            (clickable ? ";cursor:pointer;transition:background 0.15s,border-color 0.15s" : ";cursor:default")
-          var chipAttrs = { style: chipStyle, title: clickable ? "点击返回此步骤重新上传" : "" }
-          if (clickable) {
-            chipAttrs.onclick = function () { jumpPdfStep(s.n) }
-            chipAttrs.onmouseenter = function () { chip.style.background = "#ecfdf5"; chip.style.borderColor = "#34d399" }
-            chipAttrs.onmouseleave = function () { chip.style.background = "#f0fdf4"; chip.style.borderColor = "#a7f3d0" }
-          }
-          var chip = el("div", chipAttrs, (done ? "✅" : "") + s.icon + " " + s.label)
-          stepBar.appendChild(chip)
-        })(steps[si])
-        if (si < steps.length - 1) {
-          stepBar.appendChild(el("span", { style: "color:#d1d5db" }, "→"))
-        }
-      }
-      wrap.appendChild(stepBar)
-    }
-
-    // 状态提示
-    if (pdfState.pdfRows) {
-      wrap.appendChild(el("div", {
-        style: "font-size:12px;color:#059669;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px 10px"
-      }, "✅ PDF 已解析：" + (pdfState.pdfFileName || "") + "（" + pdfState.pdfRows.length + " 行）"))
-    }
-    if (pdfState.excelRows) {
-      wrap.appendChild(el("div", {
-        style: "font-size:12px;color:#059669;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px 10px"
-      }, "✅ Excel 已解析：" + (pdfState.excelFileName || "") + "（" + pdfState.excelRows.length + " 行）"))
-    }
-
-    if (!pdfState.mode) {
-      // 步骤0：选择修正入口（单件 / 套装）
-      wrap.appendChild(renderModePicker(selectPdfMode))
-    } else if (!pdfState.pdfRows) {
-      // 步骤1：上传 PDF
-      wrap.appendChild(makeDropZone("点击上传或拖拽 PDF", "支持 .pdf（文本型，非扫描件）", "📄", "pdf", function (file) { processPdfFile(file) }))
-    } else if (!pdfState.excelRows) {
-      // 步骤2：上传 Excel（匹配规则与 Excel 入口一致：SKU 优先、UPC 兜底，v1.7.2）
-      wrap.appendChild(makeDropZone("请上传采购订单 Excel", "需含 SKU 列（优先匹配）与内部参考号列（SKU 缺失兜底）", "📊", "excel", function (file) { processPdfExcelFile(file) }))
-    } else {
-      // 步骤3：预览 + 重置
-      var btnRow = el("div", { style: "display:flex;gap:8px" }, [
-        el("button", {
-          onclick: function () { previewPdfChanges() },
-          style: "flex:1;padding:10px;border:none;border-radius:8px;background:#7c3aed;color:#fff;font-size:13px;font-weight:600;cursor:pointer"
-        }, "👁 预览修改"),
-        el("button", {
-          onclick: function () { resetPdfState() },
-          style: "padding:10px 14px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#6b7280;font-size:13px;cursor:pointer"
-        }, "重置")
-      ])
-      wrap.appendChild(btnRow)
-    }
-    return wrap
   }
 
   // 入口选择器：单件 / 套装（PDF/Excel 两流共用，onSelect 接收 modeId）
@@ -1560,25 +1193,6 @@
     }
     wrap.appendChild(row)
     return wrap
-  }
-
-  function selectPdfMode(modeId) {
-    if (!PDF_MODES[modeId]) return
-    clearPdfData()
-    pdfState.mode = modeId
-    refreshCard()
-  }
-
-  function clearPdfData() {
-    pdfState.mode = null
-    pdfState.pdfRows = null
-    pdfState.pdfFileName = null
-    pdfState.pdfFormat = null
-    pdfState.coupon = 0
-    pdfState.excelRows = null
-    pdfState.excelFileName = null
-    pdfState.changes = null
-    pdfState.error = null
   }
 
   function fileExt(name) {
@@ -1630,11 +1244,6 @@
     zone.appendChild(el("div", { style: "font-size:13px;color:#374151;font-weight:500" }, title))
     zone.appendChild(el("div", { style: "font-size:11px;color:#9ca3af;margin-top:4px" }, hint))
     return zone
-  }
-
-  function resetPdfState() {
-    clearPdfData()
-    refreshCard()
   }
 
   // ═══════════════════════════════════════════
@@ -2247,32 +1856,6 @@
     refreshCard()
   }
 
-  // 步骤条跳转：回到已完成步骤重新执行（防误上传，如误传 PDF 后点「上传 PDF」重传）
-  // target: 1=上传PDF, 2=上传Excel, 3=预览确认
-  function jumpPdfStep(target) {
-    if (target === 1) {
-      // 回到上传 PDF：清空 PDF 及其下游（Excel / 匹配结果 / 格式 / Coupon）
-      pdfState.pdfRows = null
-      pdfState.pdfFileName = null
-      pdfState.pdfFormat = null
-      pdfState.coupon = 0
-      pdfState.excelRows = null
-      pdfState.excelFileName = null
-      pdfState.changes = null
-      pdfState.error = null
-    } else if (target === 2) {
-      // 回到上传 Excel：清空 Excel 及匹配结果，保留已解析的 PDF
-      if (!pdfState.pdfRows) return
-      pdfState.excelRows = null
-      pdfState.excelFileName = null
-      pdfState.changes = null
-    } else if (target === 3) {
-      // 预览确认：需 PDF 与 Excel 均已上传（无需清数据，UI 自动切到该步骤）
-      if (!pdfState.pdfRows || !pdfState.excelRows) return
-    }
-    refreshCard()
-  }
-
   // ═══════════════════════════════════════════
   //  4. 标签条（已移除：Excel 预览窗口 Tab 管理待重新设计后恢复）
   // ═══════════════════════════════════════════
@@ -2335,63 +1918,6 @@
     }
     var existing = document.getElementById(PREFIX + "modal_overlay")
     if (existing) existing.remove()
-  }
-
-  // ═══════════════════════════════════════════
-  //  7b. PDF 区流程：选入口 → 上传 → 解析 → 匹配(按入口分发) → 预览 → 写回
-  // ═══════════════════════════════════════════
-  async function processPdfFile(file) {
-    try {
-      showToast("解析 PDF 中...", "info")
-      pdfState.error = null
-      var data = await file.arrayBuffer()
-      var result = await parsePdf(data)
-      var pdfRows = result.rows || []
-      if (!pdfRows.length) {
-        pdfState.error = "PDF 中未找到表格数据（0 行）"
-        refreshCard()
-        showToast(pdfState.error, "error")
-        return
-      }
-      pdfState.pdfRows = pdfRows
-      pdfState.pdfFileName = file.name
-      pdfState.pdfFormat = result.format
-      pdfState.coupon = result.coupon || 0
-      pdfState.excelRows = null
-      pdfState.excelFileName = null
-      pdfState.changes = null
-      refreshCard()
-      showToast("PDF 解析成功：" + pdfRows.length + " 行（格式" + result.format + "，Coupon=" + pdfState.coupon + "），请上传 Excel", "success")
-    } catch (err) {
-      pdfState.error = err.message || String(err)
-      refreshCard()
-      showToast("PDF 解析失败: " + pdfState.error, "error")
-      console.error("[Odoo PDF]", err)
-    }
-  }
-
-  async function processPdfExcelFile(file) {
-    try {
-      pdfState.error = null
-      var data = await file.arrayBuffer()
-      var excelRows = parseOrderExcel(data)
-      if (!excelRows.length) {
-        pdfState.error = "Excel 中没有有效数据"
-        refreshCard()
-        showToast(pdfState.error, "error")
-        return
-      }
-      pdfState.excelRows = excelRows
-      pdfState.excelFileName = file.name
-      pdfState.changes = applyPdfByMode(pdfState.pdfRows, excelRows, pdfState.mode, pdfState.coupon, "pdf")
-      refreshCard()
-      showToast("匹配完成，可点击预览", "success")
-    } catch (err) {
-      pdfState.error = err.message || String(err)
-      refreshCard()
-      showToast("Excel 解析失败: " + pdfState.error, "error")
-      console.error("[Odoo PDF]", err)
-    }
   }
 
   // ── Excel 导入流（2026-08-19 改造：与 PDF 流同逻辑；v1.12.0 支持多个转换版文件）──
@@ -2623,21 +2149,6 @@
     return (v === null || v === undefined || v === "") ? "—" : String(v)
   }
 
-  async function previewPdfChanges() {
-    if (!pdfState.changes) return
-    try {
-      showToast("查询 Odoo 订单行中...", "info")
-      var previewRows = await buildPdfPreviewRows(pdfState.changes)
-      updateLoadingOverlay(null)
-      var modeLabel = pdfState.mode ? "[" + PDF_MODES[pdfState.mode].label + "] " : ""
-      buildPdfPreviewModal(previewRows, modeLabel + pdfState.pdfFileName + " + " + pdfState.excelFileName)
-    } catch (err) {
-      updateLoadingOverlay(null)
-      showToast("预览失败: " + (err.message || err), "error")
-      console.error("[Odoo PDF]", err)
-    }
-  }
-
   // 字段展示顺序（按入口；2026-08-19 起 Excel 流与 PDF 流同一布局，source 仅保留兼容签名）
   // v3.0：去掉箱规价（用户确认：Odoo 无对应字段，不再展示）
   // v3.1.1：去掉整箱批发价列（用户确认 2026-08-27；缺货行 boxWholesale 字段仍保留在 fields 里，置 0 写回不受影响）
@@ -2667,7 +2178,7 @@
     removeModals()
     source = source || "pdf"
     // mode 优先取预览行自带标记（applyPdfByMode 已按入口盖章），兜底再读两流状态（2026-08-19：Excel 流也走 pdf 布局）
-    var mode = (previewRows.length && previewRows[0].mode) || (source === "excel" ? excelState.mode : pdfState.mode)
+    var mode = (previewRows.length && previewRows[0].mode) || excelState.mode
     var titleIcon = source === "excel" ? "📊" : "📄"
     // 去重订单关联号列表（2026-08-18 用户要求：显示具体关联号，如 P00393|P00395|...）
     var refSet = {}
