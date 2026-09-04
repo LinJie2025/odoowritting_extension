@@ -106,7 +106,7 @@ odoowritting_extension/
 | 块 | 内容 | 关键函数 |
 |---|---|---|
 | 常量 | 字段映射、列名、前缀 | — |
-| 工具 | DOM 创建 `el()`、HTML 转义 `escHtml()`、`sleep`、价格计算 | `calcBoxPrice`（×0.9，整数分运算防浮点误差）、`parsePieces`（从 "1 box of 20 pieces" 取 20） |
+| 工具 | DOM 创建 `el()`、HTML 转义 `escHtml()`、`sleep`、价格计算 | `calcBoxPrice`（×0.9，**v3.5 起精确到 2 位小数四舍五入**）、`parsePieces`（从 "1 box of 20 pieces" 取 20） |
 | Odoo API | JSON-RPC 封装 | `rpcCall`、`searchPoByRef`、`getOrderLines`（含 `product_packaging_qty`）、`updateOrderLine`；`searchPoByName` 已无用可删 |
 | Excel 解析 | 按表头列名解析 | `parseOrderExcel`（PDF/Excel 两流共用） |
 | PDF 解析 | 文本块坐标聚类成表 | `parsePdf`（pdfjs 入口）、`extractPdfTable`（核心算法） |
@@ -129,8 +129,8 @@ odoowritting_extension/
 |---|---|---|
 | `rpcCall(endpoint, params)` | 通用调用 | body: `{jsonrpc:"2.0", method:"call", params, id}` |
 | `searchPoByName(name)` | Excel 导入流查 PO | domain `[["name","=",name]]`，fields 需含 `order_line` |
-| `searchPoByRef(ref)` | PDF 流查 PO | domain 用 `ODOO_FIELDS.poRef`（=name），fields 需含 `name`（否则查询为空） |
-| `getOrderLines(ids)` | 批量取订单行 | fields: `id,name,price_unit,box_wholesale_price,price_subtotal,remark,product_packaging_qty,product_id,product_packaging_id`（**v3.0 补读 price_subtotal**，套装小计比对原值）；**v1.9 匹配键 = `product.default_code`（UPC）+ `product.packaging.qty`（包装件数）**，default_code 为空时用 `line.name` 正则 `\[(\d+)\]` 兜底（旧数据兼容）；内部追加查 `product.product`（default_code）与 `product.packaging`（name/qty） |
+| `searchPoByRef(ref)` | PDF 流查 PO | domain 用 `ODOO_FIELDS.poRef`（=name），fields 需含 `name`（否则查询为空）；**v3.7 补读 `partner_id`**（supplierinfo 二级匹配按供应商过滤用） |
+| `getOrderLines(ids, partnerId)` | 批量取订单行 | fields: `id,name,price_unit,box_wholesale_price,price_subtotal,remark,product_packaging_qty,product_id,product_packaging_id`（**v3.0 补读 price_subtotal**，套装小计比对原值）；**v1.9 主匹配键 = `product.default_code`（UPC）+ `product.packaging.qty`（包装件数）**，default_code 为空时用 `line.name` 正则 `\[(\d+)\]` 兜底（旧数据兼容）；内部追加查 `product.product`（default_code/product_tmpl_id）与 `product.packaging`（name/qty）；**v3.7（2026-09-04）二级匹配键 = `product.supplierinfo.product_code`**——传入 PO partner_id 后查该供应商名下 supplierinfo（模板级 + 变体级两段 search_read），行级返回 `supplierCodes`（去重、剔除与 default_code 重复项），供 `loadOrderLineMap` 注册 supMap/supCnt 次键索引 |
 | `updateOrderLine(lineId, payload)` | 写回单行 | `write` 方法 |
 
 > 注意：`searchPoByName` 与 `searchPoByRef` 逻辑几乎重复（都查 name），系历史遗留，重构时可合并。
@@ -163,7 +163,7 @@ odoowritting_extension/
 >   - 拆分后仍匹配不上的 Excel 行 → 归入 outstock（缺货，用户确认 2026-08-20）；PDF 侧多余行静默忽略
 > - ×0.9 开关：`Coupon=0` → factor=1（不打折）；`Coupon≠0`（负数）→ factor=0.9
 > - 数量核对（v2.0）：**按 pair.matchKey 分组**求和 Excel「包装数量」（v3.0 起；原「abw交货箱数」列作废） vs **PDF Qty 总和**（同一转换版行被多个订单关联命中时 PDF Qty 只计一次）。SKU 匹配行按 Catalog 聚合（同 SKU 拆多个订单关联/多个 UPC 合并比对，不再各自报错）；UPC 唯一行按 UPC 聚合；拆分匹配行按 `UPC+包装` 聚合（不同包装独立核对，不合并求和）。不一致 modal 提示（不自动扣减）
-> - **Odoo 行匹配（v1.9 改，2026-08-20 用户需求）**：写回匹配键从「UPC」改为「**UPC + 订单行/包装**」——UPC = Excel「内部参考号」↔ Odoo `order_line/product_id/default_code`（default_code 为空时用 name 正则 `\[(\d+)\]` 兜底）；包装 = Excel「订单行/包装」件数（`extractPackQty` 提取）↔ Odoo `order_line/product_packaging_id`（取其 qty）。**Excel 有包装件数 → 精确匹配（UPC+包装），失败且该 UPC 在 PO 中唯一 → 按 UPC 兜底，多行 → 报「未找到匹配的订单行」不写回（防错配其他包装行）；Excel 无包装件数 → 仅 UPC 唯一时命中，多行同样报未找到**
+> - **Odoo 行匹配（v1.9 改，2026-08-20 用户需求；v3.7 加二级键，2026-09-04）**：写回匹配键从「UPC」改为「**UPC + 订单行/包装**」——UPC = Excel「内部参考号」↔ Odoo `order_line/product_id/default_code`（default_code 为空时用 name 正则 `\[(\d+)\]` 兜底）；包装 = Excel「订单行/包装」件数（`extractPackQty` 提取）↔ Odoo `order_line/product_packaging_id`（取其 qty）。**v3.7（2026-09-04，只读库实测 28 行错位、活跃单 13 行）**：部分产品 `default_code` 被改过号，供应商票据 UPC 只存在于 `product.supplierinfo.product_code`（与 line.name `[码]` 同值）→ 主键匹配不上时**按 PO 供应商（partner_id）过滤的 supplierinfo.product_code 二级兜底**（`searchPoByRef` 补 partner_id → `getOrderLines(ids, partnerId)` 查模板级+变体级 supplierinfo 得行级 `supplierCodes` → `loadOrderLineMap` 注册 `supMap/supCnt` → `buildPreviewRows` 主键未命中再试次键，包装精确 + UPC 唯一兜底 + 多行防错配同主键）。**Excel 有包装件数 → 精确匹配（UPC+包装），失败且该 UPC 在 PO 中唯一 → 按 UPC 兜底，多行 → 报「未找到匹配的订单行」不写回（防错配其他包装行）；Excel 无包装件数 → 仅 UPC 唯一时命中，多行同样报未找到**
 > - 缺货备注：① 包装数量为空/0；② Excel 有而 PDF 无 → 都备注「缺货」写 remark
 > - **缺货行写回（v1.12.4 改，2026-08-26 用户需求，取代 v1.8.0）**：**所有缺货行**（缺货①匹配不上 + 缺货② boxQty 空/0，Excel 与 PDF 两入口统一）除备注「缺货」外，**单价（price_unit）与整箱批发价（box_wholesale_price）都置 0 写回**。实现：缺货② 的 unitPrice/boxPrice09（套装）字段 newValue 置 0、odooField 保留（不再置 null）；缺货① 的 fields 追加 `unitPrice=0` + `boxWholesale=0` 两字段；单件入口缺货② 追加 `boxWholesale` 字段（label 整箱批发价，v1.12.4 新增）。⚠️ 旧规则（v1.8.0：Excel 入口缺货行价格**不写回**）已作废。注意：缺货①行能否写回取决于 Odoo 行是否匹配到（匹配不到仍 error 不可写）
 >
@@ -174,7 +174,7 @@ odoowritting_extension/
 > |---|---|---|---|
 > | 单价 | `UNIT PRICE × factor ÷ 套装单件数量` | Odoo `price_unit` | ✅ `price_unit` |
 > | 0.9箱规价 | `UNIT PRICE × factor` | Odoo `box_wholesale_price` | ✅ `box_wholesale_price` |
-> | 0.9总价 | `Subtotal × factor` | Odoo `price_subtotal`（只读比对） | ❌ |
+> | 0.9总价 | `0.9箱规价 × 包装数量`（v3.6 动态列；旧 `Subtotal×factor` 作废） | Odoo `price_subtotal`（只读比对） | ❌ |
 > - **箱规价字段已移除（v3.0，2026-08-26 用户确认）**：Odoo 无对应字段，modal 不再展示
 > - **套装单件数量**：从 PDF `PRODUCT DESCRIPTION` 提取 `x(\d+)`（"x30"→30）；提取不到**降级**用 Excel「订单行/包装」pieces（"1 box of XX pieces" 的 XX）
 > - 无 coupon 照算：factor=1 代入全部公式
@@ -187,7 +187,8 @@ odoowritting_extension/
 > - 不一致字段为**可编辑输入框**，单元格内两行小字：PDF 来源计算值（如 `PDF: 50×0.9÷30 = 1.5`）+ Odoo 原值
 > - 悬浮不一致字段显示**原因气泡**（原因由 content.js 内置 `REASONS` 字典生成，v3.0 文案改「Odoo」）
 > - 表格底部**总和行**：所有数值列（包装数量/单价/0.9箱规价/0.9总价）全表合计，随编辑实时刷新
-> - **组小计（v3.1，2026-08-27 用户需求）**：套装入口按订单关联分组，每组尾部插一行「{订单关联号} 小计」，只累计 **0.9总价列**（全部行、不区分勾选），随编辑实时刷新；单件入口（无 total09 字段）不插组小计行；底部全表合计行保留
+> - **0.9总价动态列（v3.6，2026-09-04 用户需求）**：0.9总价列改为**只读动态计算列**——套装 = 0.9箱规价 × 包装数量、单件 = 单价 × 包装数量（单件入口新增此列，2026-09-04 用户确认）；modal 里修改「包装数量」/价格输入框时该列实时重算（`recalcRowTotal`，输入事件 → 重算 total09 → `refreshTotal`）；仍保留与 Odoo `price_subtotal` 的原值比对（不一致红框 + Odoo 原值小字），`odooField=null` 永不写回；底部总和与组小计（v3.1，单件入口本次起同样插组小计行）按动态值实时刷新
+> - **组小计（v3.1，2026-08-27 用户需求；v3.6 起单件入口同样插）**：按订单关联分组，每组尾部插一行「{订单关联号} 小计」，只累计 **0.9总价列**（全部行、不区分勾选），随编辑实时刷新；底部全表合计行保留
 
 ```
 步骤0 选修正入口（单件📦 / 套装🎁）
@@ -393,6 +394,10 @@ odoowritting_extension/
 | 18 | modal 按订单关联分组小计（2026-08-27 用户需求） | `renderPdfPreviewTable`（tbody 分组插行）/`renderPdfGroupSubtotalRow`（组小计行，只累计 total09）/`refreshTotal`（组小计实时刷新） | ⚠️ v3.1（manifest v1.14.0）已实现：套装入口每组尾部插「{订单关联号} 小计」行，只对 0.9总价列组内合计（全部行）；单件入口不插；全表合计行保留。语法通过，待 Chrome 冒烟验证 |
 | 19 | 移除 PDF 修正入口（2026-08-27 用户需求） | `renderTabSwitch`/`renderCardContent`/`renderExcelZone`/`excelState`（pdfState、renderPdfZone、processPdfFile、extractPdfTable、parsePdf 等已删） | ✅ v3.2（manifest v1.15.0）已实现：Tab 剩 Excel 导入 + 商品库更新；manifest 移除 pdf.min.js/pdf.worker.min.js 加载（lib 文件保留）；共享的 applyPdfByMode/匹配/预览/写回链路由 Excel 流独占。语法通过，副本已同步，待 Chrome 冒烟 |
 | 20 | SKU 更新（2026-08-27 用户需求） | `PACKAGING_ODOO_FIELDS`/`loadPackagingByUpc`/`matchSkuPackaging`/`matchPdfToExcel`（matchLevel）/`applyPdfSingle`/`applyPdfSet`（skuUpdate）/`parseOrderExcel`（colIdxCatalog 按入口定列）/`buildPreviewRows`/`renderPdfPreviewRow`（SKU 列对照）/`executePdfUpdate` | ⚠️ v3.3 + v3.4（manifest v1.17.0）已实现：UPC 匹配成功行用转换 Excel SKU 更新 product.packaging——单件入口写 single_sku（不识别规格，qty=1 定位；SKU 列=「订单行/包装/SKU」）、套装入口按套装数量比对 XX 写 box_sku（SKU 列=「订单行/包装/Box SKU」）；SKU 列旧→新对照，变更默认勾选；失败文案拆 5 种；找不到规格跳过并提示。语法通过，副本已同步，待 Chrome 冒烟验证 |
+| 21 | modal 0.9总价 改动态计算列（2026-09-04 用户需求） | `applyPdfSingle`/`applyPdfSet`（total09 字段 = 价格×包装数量）/`fieldOrder`（单件入口也含 total09）/`renderPdfPreviewRow`（total09 readonly + 初始值取 newValue）/`recalcRowTotal`（新增：编辑 boxQty/价格 → 重算本行 total09）/`refreshTotal`（总和+组小计随动态值刷新） | ⚠️ v3.6（manifest v1.19.0）+ v3.6.1 补丁（manifest v1.19.1）已实现：0.9总价列两入口都展示（套装=0.9箱规价×包装数量、单件=单价×包装数量，2026-09-04 用户确认），readonly 动态重算；保留 Odoo price_subtotal 原值比对（不一致红框）；单件入口本次起同样插「订单关联 小计」行；total09 odooField=null 不写回。**v3.6.1 补丁（2026-09-04 用户需求）**：Odoo 匹配不上订单行的价格数据（oldValue 无回填）也照常显示计算值——新增 `fieldInitValue`（newValue 优先，无计算值退回 fieldDisplayVal），输入框初值与 colMaxLen 列宽统一用该口径（含 0.9总价/单价/0.9箱规价），无法比对原值的行不显示 Odoo 原值小字。语法通过，副本已同步，待 Chrome 冒烟验证 |
+| 22 | Odoo 行匹配加 supplierinfo.product_code 二级键（2026-09-04 用户需求，只读库验证后实施） | `searchPoByRef`（补 partner_id）/`getOrderLines(ids, partnerId)`（查模板级+变体级 supplierinfo → 行级 supplierCodes）/`loadOrderLineMap`（supMap/supCnt 次键注册，defaultCode 空但有 supplierCodes 的行不再丢弃）/`buildPreviewRows`（主键未命中 → 次键，包装精确+唯一兜底+多行防错配） | ⚠️ v3.7（manifest v1.20.0）已实现。验证依据（只读库 p169_erp，2026-09-04）：`8800366240575` 不在 default_code、在 `supplierinfo.product_code`（partner 1354 ABW，tmpl 8608/var 608，default_code=8800256119219）；全库 4096 行中 28 行 line.name 票据码 ≠ default_code，活跃单（purchase 11 + sent 2）13 行，样例 10/10 name `[码]` == supplierinfo.product_code。主键 default_code 优先、不中再按 PO 供应商的 supplierinfo.product_code（含包装精确/唯一兜底/多行报未找到，防错配）。语法通过，副本已同步，待 Chrome 冒烟验证（重点：P09770 等 ABW 单 medicube 防晒霜/TXA 精华行不再报未找到） |
+| 23 | 缺货①行「Odoo 原值」删除线小字残留非 0（2026-09-04 用户反馈） | `applyPdfSingle`/`applyPdfSet`（outstock① 分支 unitPrice 字段） | ✅ v3.7.1（manifest v1.20.1）已修复：kind=outstock 行 unitPrice 的 oldValue 原存采购单 Excel 单价列残留值（v3.0 已废 Excel 价格列作比对、kind=outstock 又故意不回填 Odoo 现值），渲染时被标成「Odoo 原值: 非0」小字误导（Odoo 已写 0 仍显示）。修复 = oldValue 置 null（缺货行价格不比对）。语法通过，副本已同步，待 Chrome 冒烟验证 |
+| 24 | 0.9总价比对实时化（2026-09-04 用户需求） | `renderPdfPreviewRow`（登记 _total09Box；total09「Odoo 原值」小字改动态、不走静态创建）/`recalcRowTotal`（重算值后触发实时比对）/新增 `syncTotal09Compare`（值 vs Odoo price_subtotal 原值动态红灰态 + 小字增删 + title） | ⚠️ v3.7.2（manifest v1.20.2）已实现：modal 里改包装数量/价格 → 0.9总价 重算后**立即与 Odoo price_subtotal 实时比对**——不一致：红框红底 + 动态删除线「Odoo 原值」小字 + title 说明；改到一致：恢复只读灰样式并移除小字；无 Odoo 原值可比对的行（匹配不上/缺货①）恒灰只展示计算值。语法通过，副本已同步，待 Chrome 冒烟验证 |
 
 ---
 
