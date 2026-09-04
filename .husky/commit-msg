@@ -1,1 +1,2 @@
-/c/Users/Administrator/.workbuddy/binaries/node/versions/22.22.2/npx --no -- commitlint --edit $1
+#!/usr/bin/env sh
+node_modules/.bin/commitlint --edit "$1"
