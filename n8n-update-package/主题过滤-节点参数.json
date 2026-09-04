@@ -1,0 +1,32 @@
+{
+  "parameters": {
+    "conditions": {
+      "options": {
+        "caseSensitive": false,
+        "leftValue": "",
+        "typeValidation": "loose"
+      },
+      "combinator": "and",
+      "conditions": [
+        {
+          "id": "0da0fe43-17ce-4bde-91c7-d50821a1f44a",
+          "leftValue": "={{ $json.subject }}",
+          "rightValue": "Abw Castlers Inventory Report",
+          "operator": {
+            "type": "string",
+            "operation": "contains"
+          }
+        }
+      ]
+    },
+    "options": {}
+  },
+  "id": "c3a98162-ac80-4261-a270-8f673030f6e2",
+  "name": "主题过滤",
+  "type": "n8n-nodes-base.filter",
+  "typeVersion": 2.2,
+  "position": [
+    -200,
+    320
+  ]
+}

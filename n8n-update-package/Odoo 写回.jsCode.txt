@@ -1,0 +1,59 @@
+const base = 'http://47.119.112.65:8069';
+const db = 'castlers-260728';
+const login = 'castlers';
+const password = 'ca8689cfaa99bf47ceda3aff3749782e0fddb15c';
+const env = { base_location: base, lang: 'en_US', timezone: 'Asia/Shanghai', user_agent: 'n8n-sku-updater/1.0' };
+const helpers = this.helpers;
+
+async function rpc(service, method, args) {
+  const res = await helpers.httpRequest({
+    url: base + '/jsonrpc', method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'call', params: { service: service, method: method, args: args } }),
+    ignoreResponseCodeErrors: true
+  });
+  let body = res;
+  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) {} }
+  if (body && body.error) {
+    const d = body.error.data || {};
+    throw new Error(d.message || body.error.message || JSON.stringify(body.error));
+  }
+  return body ? body.result : null;
+}
+
+const uid = await rpc('common', 'authenticate', [db, login, password, env]);
+
+async function callKw(model, method, args, kwargs) {
+  return rpc('object', 'execute_kw', [db, uid, password, model, method, args, kwargs || {}]);
+}
+
+const j = $input.first().json;
+const skuWrites = j.skuWrites || [];
+const productWrites = j.productWrites || [];
+const results = { sku: [], product: [], errors: [] };
+const groups = {};
+for (const w of productWrites) {
+  const k = JSON.stringify(w.vals);
+  if (!groups[k]) groups[k] = [];
+  groups[k].push(w.id);
+}
+for (const k in groups) {
+  const vals = JSON.parse(k);
+  try {
+    await callKw('product.product', 'write', [groups[k], vals], {});
+    results.product.push({ ids: groups[k], vals: vals, status: 'ok' });
+  } catch (e) {
+    results.errors.push({ kind: 'product', ids: groups[k], error: String(e.message || e) });
+  }
+}
+for (const w of skuWrites) {
+  const payload = {};
+  payload[w.field] = w.sku;
+  try {
+    await callKw('product.packaging', 'write', [[w.id], payload], {});
+    results.sku.push({ id: w.id, field: w.field, sku: w.sku, oldValue: w.oldValue || '', status: 'ok' });
+  } catch (e) {
+    results.errors.push({ kind: 'packaging', id: w.id, field: w.field, error: String(e.message || e) });
+  }
+}
+return [{ json: { stats: j.stats, fileNames: j.fileNames, report: j.report || [], results: results } }];

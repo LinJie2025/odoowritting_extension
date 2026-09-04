@@ -1,0 +1,68 @@
+const items = $input.all();
+const skuWrites = [];
+const productWrites = [];
+const report = [];
+const stats = { total: 0, notfound: 0, dup: 0, noSku: 0, noPack: 0, updated: 0, skipped: 0, productUpdated: 0, productSkipped: 0, skuUpdated: 0, skuSkipped: 0 };
+const fileNames = {};
+
+function norm(v) { return (v === undefined || v === null) ? '' : String(v).trim(); }
+function same(a, b) { return norm(a) === norm(b); }
+
+for (const it of items) {
+  const r = it.json;
+  stats.total++;
+  if (r.fileName) fileNames[r.fileName] = true;
+  const entry = { upc: r.upc, mode: r.mode, status: '', reason: '', changes: [] };
+
+  if (!r.productIds || r.productIds.length === 0) {
+    entry.status = 'notfound'; entry.reason = 'Odoo 未找到该 UPC 的产品'; stats.notfound++; report.push(entry); continue;
+  }
+  if (r.productIds.length > 1) {
+    entry.status = 'dup'; entry.reason = 'Odoo 存在多个同 UPC 产品，无法确定目标'; stats.dup++; report.push(entry); continue;
+  }
+  const pid = r.productIds[0];
+  const prod = r.prod || {};
+  const extraTips = [];
+
+  // 产品字段对比（brand / origin_country）：Excel 有值才对比，不同才写
+  const vals = {};
+  if (r.brand) {
+    if (!same(prod.brand, r.brand)) { vals.brand = r.brand; entry.changes.push({ field: 'brand', old: prod.brand || '', new: r.brand }); }
+  }
+  if (r.country) {
+    if (!same(prod.origin_country, r.country)) { vals.origin_country = r.country; entry.changes.push({ field: 'origin_country', old: prod.origin_country || '', new: r.country }); }
+  }
+  if (Object.keys(vals).length) { productWrites.push({ id: pid, upc: r.upc, vals: vals }); stats.productUpdated++; }
+  else { stats.productSkipped++; }
+
+  // SKU 对比（single_sku / box_sku）
+  if (r.sku) {
+    let p = null, field = '';
+    if (r.mode === 'single') {
+      field = 'single_sku';
+      p = (r.packs || []).find(function (pk) { return Number(pk.qty) === 1; });
+    } else {
+      field = 'box_sku';
+      const N = r.packN;
+      p = (r.packs || []).find(function (pk) { const mm = (pk.name || '').match(/1 box of (\d+) pieces/i); return mm && parseInt(mm[1], 10) === N; })
+        || (r.packs || []).find(function (pk) { return Number(pk.qty) === N; });
+    }
+    if (!p) {
+      extraTips.push('找不到匹配包装规格，SKU 不更新'); stats.noPack++;
+    } else if (!same(p[field], r.sku)) {
+      skuWrites.push({ id: p.id, upc: r.upc, sku: r.sku, field: field, spec: p.name, oldValue: p[field] || '' });
+      entry.changes.push({ field: field, old: p[field] || '', new: r.sku });
+      stats.skuUpdated++;
+    } else {
+      extraTips.push('SKU 与 Odoo 一致'); stats.skuSkipped++;
+    }
+  } else {
+    extraTips.push('Excel 无 SKU，不处理'); stats.noSku++;
+  }
+
+  if (entry.changes.length) { entry.status = 'updated'; entry.reason = '有差异，待写回'; stats.updated++; }
+  else { entry.status = 'skipped'; entry.reason = '与 Odoo 现有值一致，跳过'; stats.skipped++; }
+  if (extraTips.length) entry.reason += '；' + extraTips.join('；');
+  report.push(entry);
+}
+return [{ json: { skuWrites: skuWrites, productWrites: productWrites, report: report, stats: stats, fileNames: Object.keys(fileNames) } }];

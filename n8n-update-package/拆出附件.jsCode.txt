@@ -1,0 +1,14 @@
+const helpers = this.helpers;
+const items = [];
+const input = $input.all();
+for (let i = 0; i < input.length; i++) {
+  const bin = input[i].binary || {};
+  for (const key of Object.keys(bin)) {
+    const b = bin[key];
+    if (!b || !b.fileName) continue;
+    if (!/\.xlsx?$/i.test(String(b.fileName))) continue;
+    const buffer = await helpers.getBinaryDataBuffer(i, key);
+    items.push({ json: { fileName: String(b.fileName) }, binary: { data: { data: buffer.toString('base64'), fileName: String(b.fileName), mimeType: b.mimeType || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', fileExtension: b.fileExtension || 'xlsx' } } });
+  }
+}
+return items;

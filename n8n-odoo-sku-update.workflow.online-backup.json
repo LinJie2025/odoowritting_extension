@@ -1,0 +1,197 @@
+{
+  "name": "邮件附件→Odoo 商品SKU/品牌/原产地更新",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "const helpers = this.helpers;\nconst items = [];\nconst input = $input.all();\nfor (let i = 0; i < input.length; i++) {\n  const bin = input[i].binary || {};\n  for (const key of Object.keys(bin)) {\n    const b = bin[key];\n    if (!b || !b.fileName) continue;\n    if (!/\\.xlsx?$/i.test(String(b.fileName))) continue;\n    const buffer = await helpers.getBinaryDataBuffer(i, key);\n    items.push({ json: { fileName: String(b.fileName) }, binary: { data: { data: buffer.toString('base64'), fileName: String(b.fileName), mimeType: b.mimeType || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', fileExtension: b.fileExtension || 'xlsx' } } });\n  }\n}\nreturn items;\n"
+      },
+      "name": "拆出附件",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        288,
+        64
+      ],
+      "id": "d3095e9b-8bf3-4ff7-838e-18023f17062c"
+    },
+    {
+      "parameters": {
+        "options": {
+          "headerRow": true,
+          "rawData": true
+        }
+      },
+      "name": "解析 Excel",
+      "type": "n8n-nodes-base.spreadsheetFile",
+      "typeVersion": 2,
+      "position": [
+        528,
+        64
+      ],
+      "id": "43a519db-f25f-4bd8-8a33-e215c0647e78"
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = [];\nfor (const it of $input.all()) {\n  const j = it.json || {};\n  const fileName = j.fileName || '';\n  const rows = Array.isArray(j.rows) ? j.rows : [j];\n  for (const r of rows) {\n    if (!r || typeof r !== 'object') continue;\n    const upcRaw = (r.Barcode !== undefined && r.Barcode !== null) ? String(r.Barcode).trim() : '';\n    if (!upcRaw) continue;\n    const m = upcRaw.match(/^(\\d{6,})\\s*x\\s*(\\d+)$/);\n    let upc, mode, packN;\n    if (m) { mode = 'set'; upc = m[1]; packN = parseInt(m[2], 10); }\n    else if (/^\\d{6,}$/.test(upcRaw)) { mode = 'single'; upc = upcRaw; packN = null; }\n    else continue;\n    let sku = null;\n    if (r.Sku !== undefined && r.Sku !== null) {\n      const s = String(r.Sku).trim().replace(/\\.0+$/g, '');\n      if (s) sku = s;\n    }\n    const brand = (r.Brand !== undefined && r.Brand !== null) ? String(r.Brand).trim() : '';\n    const country = (r.Country !== undefined && r.Country !== null) ? String(r.Country).trim() : '';\n    out.push({ json: { fileName, upc, mode, packN, sku, brand, country } });\n  }\n}\nreturn out;"
+      },
+      "name": "整理行",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        768,
+        64
+      ],
+      "id": "8dd66c6f-2d9c-4b40-850a-2cf8b854f262"
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = 'http://47.119.112.65:8069';\nconst db = 'castlers-260728';\nconst login = 'castlers';\nconst password = 'ca8689cfaa99bf47ceda3aff3749782e0fddb15c';\nconst env = { base_location: base, lang: 'en_US', timezone: 'Asia/Shanghai', user_agent: 'n8n-sku-updater/1.0' };\nconst helpers = this.helpers;\n\nasync function rpc(service, method, args) {\n  const res = await helpers.httpRequest({\n    url: base + '/jsonrpc', method: 'POST',\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify({ jsonrpc: '2.0', method: 'call', params: { service: service, method: method, args: args } }),\n    ignoreResponseCodeErrors: true\n  });\n  let body = res;\n  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) {} }\n  if (body && body.error) {\n    const d = body.error.data || {};\n    throw new Error(d.message || body.error.message || JSON.stringify(body.error));\n  }\n  return body ? body.result : null;\n}\n\nconst uid = await rpc('common', 'authenticate', [db, login, password, env]);\n\nasync function callKw(model, method, args, kwargs) {\n  return rpc('object', 'execute_kw', [db, uid, password, model, method, args, kwargs || {}]);\n}\n\nconst items = $input.all();\nconst upcSet = {};\nfor (const it of items) { const u = it.json.upc; if (u) upcSet[u] = true; }\nconst upcs = Object.keys(upcSet);\nconst prodMap = {};\nfor (let s = 0; s < upcs.length; s += 500) {\n  const slice = upcs.slice(s, s + 500);\n  const rows = await callKw('product.product', 'search_read', [], { domain: [['default_code', 'in', slice]], fields: ['id', 'default_code'] });\n  for (const r of rows) {\n    const c = String(r.default_code || '').trim();\n    if (!c) continue;\n    if (!prodMap[c]) prodMap[c] = [];\n    prodMap[c].push({ id: r.id });\n  }\n}\nconst ids = [];\nfor (const k in prodMap) { for (const p of prodMap[k]) ids.push(p.id); }\nconst packsByProduct = {};\nfor (let s = 0; s < ids.length; s += 500) {\n  const slice = ids.slice(s, s + 500);\n  const rows = await callKw('product.packaging', 'search_read', [], { domain: [['product_id', 'in', slice]], fields: ['id', 'name', 'qty', 'product_id'] });\n  for (const r of rows) {\n    const pid = (r.product_id && r.product_id.length) ? r.product_id[0] : null;\n    if (!pid) continue;\n    if (!packsByProduct[pid]) packsByProduct[pid] = [];\n    packsByProduct[pid].push({ id: r.id, name: r.name || '', qty: r.qty });\n  }\n}\nconst out = [];\nfor (const it of items) {\n  const j = it.json;\n  const list = prodMap[j.upc] || null;\n  const productIds = list ? list.map(function (p) { return p.id; }) : [];\n  let packs = [];\n  if (productIds.length === 1) packs = packsByProduct[productIds[0]] || [];\n  out.push({ json: { fileName: j.fileName, upc: j.upc, mode: j.mode, packN: j.packN, sku: j.sku, brand: j.brand, country: j.country, productIds: productIds, packs: packs } });\n}\nreturn out;\n"
+      },
+      "name": "Odoo 查询",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1008,
+        64
+      ],
+      "id": "4ae12747-fd8a-48a2-a0ca-85072c1f7be1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst skuWrites = [];\nconst productWrites = [];\nconst stats = { total: 0, notfound: 0, dup: 0, noSku: 0, noPack: 0, skuWrite: 0, productWrite: 0 };\nconst fileNames = {};\nfor (const it of items) {\n  const r = it.json;\n  stats.total++;\n  if (r.fileName) fileNames[r.fileName] = true;\n  if (!r.productIds || r.productIds.length === 0) { stats.notfound++; continue; }\n  if (r.productIds.length > 1) { stats.dup++; continue; }\n  const pid = r.productIds[0];\n  const vals = {};\n  if (r.brand) vals.brand = r.brand;\n  if (r.country) vals.origin_country = r.country;\n  if (Object.keys(vals).length) { productWrites.push({ id: pid, upc: r.upc, vals: vals }); stats.productWrite++; }\n  if (r.sku) {\n    if (r.mode === 'single') {\n      const p = (r.packs || []).find(function (pk) { return Number(pk.qty) === 1; });\n      if (p) { skuWrites.push({ id: p.id, upc: r.upc, sku: r.sku, field: 'single_sku', spec: p.name }); stats.skuWrite++; }\n      else { stats.noPack++; }\n    } else {\n      const N = r.packN;\n      const p = (r.packs || []).find(function (pk) { const mm = (pk.name || '').match(/1 box of (\\d+) pieces/i); return mm && parseInt(mm[1], 10) === N; })\n        || (r.packs || []).find(function (pk) { return Number(pk.qty) === N; });\n      if (p) { skuWrites.push({ id: p.id, upc: r.upc, sku: r.sku, field: 'box_sku', spec: p.name }); stats.skuWrite++; }\n      else { stats.noPack++; }\n    }\n  } else { stats.noSku++; }\n}\nreturn [{ json: { skuWrites: skuWrites, productWrites: productWrites, stats: stats, fileNames: Object.keys(fileNames) } }];"
+      },
+      "name": "计算变更集",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1248,
+        64
+      ],
+      "id": "b98d5569-f49b-489f-b76a-3b3875a15eb9"
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = 'http://47.119.112.65:8069';\nconst db = 'castlers-260728';\nconst login = 'castlers';\nconst password = 'ca8689cfaa99bf47ceda3aff3749782e0fddb15c';\nconst env = { base_location: base, lang: 'en_US', timezone: 'Asia/Shanghai', user_agent: 'n8n-sku-updater/1.0' };\nconst helpers = this.helpers;\n\nasync function rpc(service, method, args) {\n  const res = await helpers.httpRequest({\n    url: base + '/jsonrpc', method: 'POST',\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify({ jsonrpc: '2.0', method: 'call', params: { service: service, method: method, args: args } }),\n    ignoreResponseCodeErrors: true\n  });\n  let body = res;\n  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) {} }\n  if (body && body.error) {\n    const d = body.error.data || {};\n    throw new Error(d.message || body.error.message || JSON.stringify(body.error));\n  }\n  return body ? body.result : null;\n}\n\nconst uid = await rpc('common', 'authenticate', [db, login, password, env]);\n\nasync function callKw(model, method, args, kwargs) {\n  return rpc('object', 'execute_kw', [db, uid, password, model, method, args, kwargs || {}]);\n}\n\nconst j = $input.first().json;\nconst skuWrites = j.skuWrites || [];\nconst productWrites = j.productWrites || [];\nconst results = { sku: [], product: [], errors: [] };\nconst groups = {};\nfor (const w of productWrites) {\n  const k = JSON.stringify(w.vals);\n  if (!groups[k]) groups[k] = [];\n  groups[k].push(w.id);\n}\nfor (const k in groups) {\n  const vals = JSON.parse(k);\n  try {\n    await callKw('product.product', 'write', [groups[k], vals], {});\n    results.product.push({ ids: groups[k], vals: vals, status: 'ok' });\n  } catch (e) {\n    results.errors.push({ kind: 'product', ids: groups[k], error: String(e.message || e) });\n  }\n}\nfor (const w of skuWrites) {\n  const payload = {};\n  payload[w.field] = w.sku;\n  try {\n    await callKw('product.packaging', 'write', [[w.id], payload], {});\n    results.sku.push({ id: w.id, field: w.field, sku: w.sku, status: 'ok' });\n  } catch (e) {\n    results.errors.push({ kind: 'packaging', id: w.id, field: w.field, error: String(e.message || e) });\n  }\n}\nreturn [{ json: { stats: j.stats, fileNames: j.fileNames, results: results } }];\n"
+      },
+      "name": "Odoo 写回",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1488,
+        64
+      ],
+      "id": "06175c66-c7a6-43c7-a3e1-333b606440b2"
+    },
+    {
+      "parameters": {
+        "format": "resolved",
+        "options": {
+          "customEmailConfig": "[[\"SUBJECT\", \"Abw Castlers Inventory Report\"],[\"UNSEEN\"]]",
+          "trackLastMessageId": true
+        }
+      },
+      "name": "Email Trigger (IMAP)",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2.1,
+      "position": [
+        48,
+        64
+      ],
+      "id": "f96e285a-4992-469c-8565-ff8c493cffb1",
+      "credentials": {
+        "imap": {
+          "id": "tlHhqvlw1kyoHVeQ",
+          "name": "IMAP account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "整理行": {
+      "main": [
+        [
+          {
+            "node": "Odoo 查询",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Odoo 查询": {
+      "main": [
+        [
+          {
+            "node": "计算变更集",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "计算变更集": {
+      "main": [
+        [
+          {
+            "node": "Odoo 写回",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Odoo 写回": {
+      "main": [
+        []
+      ]
+    },
+    "Email Trigger (IMAP)": {
+      "main": [
+        [
+          {
+            "node": "拆出附件",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "拆出附件": {
+      "main": [
+        [
+          {
+            "node": "解析 Excel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "解析 Excel": {
+      "main": [
+        [
+          {
+            "node": "整理行",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "726c27c3-33f2-47c7-bb0f-708be5ce9039",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "cf4f33fa03095cb9f8d5b7ebda67782f79b19cdd62b2fcc231e03d35ed083617"
+  },
+  "nodeGroups": [],
+  "id": "tp7bvgKQSutq1O4c",
+  "tags": []
+}

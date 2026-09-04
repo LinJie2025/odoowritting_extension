@@ -1,0 +1,25 @@
+const out = [];
+for (const it of $input.all()) {
+  const j = it.json || {};
+  const fileName = j.fileName || '';
+  const rows = Array.isArray(j.rows) ? j.rows : [j];
+  for (const r of rows) {
+    if (!r || typeof r !== 'object') continue;
+    const upcRaw = (r.Barcode !== undefined && r.Barcode !== null) ? String(r.Barcode).trim() : '';
+    if (!upcRaw) continue;
+    const m = upcRaw.match(/^(\d{6,})\s*x\s*(\d+)$/);
+    let upc, mode, packN;
+    if (m) { mode = 'set'; upc = m[1]; packN = parseInt(m[2], 10); }
+    else if (/^\d{6,}$/.test(upcRaw)) { mode = 'single'; upc = upcRaw; packN = null; }
+    else continue;
+    let sku = null;
+    if (r.Sku !== undefined && r.Sku !== null) {
+      const s = String(r.Sku).trim().replace(/\.0+$/g, '');
+      if (s) sku = s;
+    }
+    const brand = (r.Brand !== undefined && r.Brand !== null) ? String(r.Brand).trim() : '';
+    const country = (r.Country !== undefined && r.Country !== null) ? String(r.Country).trim() : '';
+    out.push({ json: { fileName, upc, mode, packN, sku, brand, country } });
+  }
+}
+return out;

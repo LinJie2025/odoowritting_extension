@@ -1,0 +1,71 @@
+const base = 'http://47.119.112.65:8069';
+const db = 'castlers-260728';
+const login = 'castlers';
+const password = 'ca8689cfaa99bf47ceda3aff3749782e0fddb15c';
+const env = { base_location: base, lang: 'en_US', timezone: 'Asia/Shanghai', user_agent: 'n8n-sku-updater/1.0' };
+const helpers = this.helpers;
+
+async function rpc(service, method, args) {
+  const res = await helpers.httpRequest({
+    url: base + '/jsonrpc', method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'call', params: { service: service, method: method, args: args } }),
+    ignoreResponseCodeErrors: true
+  });
+  let body = res;
+  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) {} }
+  if (body && body.error) {
+    const d = body.error.data || {};
+    throw new Error(d.message || body.error.message || JSON.stringify(body.error));
+  }
+  return body ? body.result : null;
+}
+
+const uid = await rpc('common', 'authenticate', [db, login, password, env]);
+
+async function callKw(model, method, args, kwargs) {
+  return rpc('object', 'execute_kw', [db, uid, password, model, method, args, kwargs || {}]);
+}
+
+const items = $input.all();
+const upcSet = {};
+for (const it of items) { const u = it.json.upc; if (u) upcSet[u] = true; }
+const upcs = Object.keys(upcSet);
+const prodMap = {};
+for (let s = 0; s < upcs.length; s += 500) {
+  const slice = upcs.slice(s, s + 500);
+  const rows = await callKw('product.product', 'search_read', [], { domain: [['default_code', 'in', slice]], fields: ['id', 'default_code', 'name', 'brand', 'origin_country'] });
+  for (const r of rows) {
+    const c = String(r.default_code || '').trim();
+    if (!c) continue;
+    if (!prodMap[c]) prodMap[c] = [];
+    prodMap[c].push({ id: r.id, name: r.name || '', brand: r.brand || '', origin_country: r.origin_country || '' });
+  }
+}
+const ids = [];
+for (const k in prodMap) { for (const p of prodMap[k]) ids.push(p.id); }
+const packsByProduct = {};
+for (let s = 0; s < ids.length; s += 500) {
+  const slice = ids.slice(s, s + 500);
+  const rows = await callKw('product.packaging', 'search_read', [], { domain: [['product_id', 'in', slice]], fields: ['id', 'name', 'qty', 'product_id', 'single_sku', 'box_sku'] });
+  for (const r of rows) {
+    const pid = (r.product_id && r.product_id.length) ? r.product_id[0] : null;
+    if (!pid) continue;
+    if (!packsByProduct[pid]) packsByProduct[pid] = [];
+    packsByProduct[pid].push({ id: r.id, name: r.name || '', qty: r.qty, single_sku: r.single_sku || '', box_sku: r.box_sku || '' });
+  }
+}
+const out = [];
+for (const it of items) {
+  const j = it.json;
+  const list = prodMap[j.upc] || null;
+  const productIds = list ? list.map(function (p) { return p.id; }) : [];
+  let prod = null;
+  let packs = [];
+  if (productIds.length === 1) {
+    prod = list[0];
+    packs = packsByProduct[productIds[0]] || [];
+  }
+  out.push({ json: { fileName: j.fileName, upc: j.upc, mode: j.mode, packN: j.packN, sku: j.sku, brand: j.brand, country: j.country, productIds: productIds, prod: prod, packs: packs } });
+}
+return out;
