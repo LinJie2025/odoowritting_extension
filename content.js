@@ -1,5 +1,5 @@
 /**
- * Odoo Excel Importer v3.4
+ * Odoo Excel Importer v3.7.2
  *
  * 可拖动按钮 → 悬浮卡片(上传/标签/日志) → Modal(可最小化)
  */
@@ -36,7 +36,7 @@
     pack: "订单行/包装",             // 取 "1 box of XX pieces" 的 XX（套装单件数量降级用 + v1.9 Odoo 包装匹配键）
     boxPrice: "箱规价",              // 箱规价（v3.0 起不再作比对基准，保留列定义兼容解析）
     boxPrice09: "0.9箱规价",         // 0.9箱规价 → box_wholesale_price
-    total09: "0.9总价",              // 0.9总价（已取消比对，保留列定义）
+    total09: "0.9总价",              // 0.9总价（v3.6 动态列：套装=0.9箱规价×包装数量、单件=单价×包装数量，只读不写回）
     unitPrice: "单价",               // 单价 → price_unit
     remark: "备注",
     orderRef: "订单关联",
@@ -118,11 +118,11 @@
     return String(val)
   }
 
-  // 价格 ×0.9（保留 3 位小数，匹配 Excel 公式精度，如 4946.91×0.9=4452.219）
+  // 价格 ×0.9（v3.5，2026-09-01 用户需求：精确到小数点后 2 位四舍五入，如 4946.91×0.9=4452.219→4452.22）
   function calcBoxPrice(subtotal) {
     var n = parseFloat(subtotal)
     if (isNaN(n)) return null
-    return Math.round(n * 0.9 * 1000) / 1000
+    return Math.round(n * 0.9 * 100) / 100
   }
 
   // 从 "1 box of 20 pieces" 解析出 20
@@ -232,19 +232,22 @@
   }
 
   // 按采购订单「订单关联」字段查询（用户确认字段=name）
+  // v3.7（2026-09-04）：补读 partner_id——supplierinfo 二级匹配需按 PO 供应商过滤供应商 product_code
   async function searchPoByRef(ref) {
     var result = await rpcCall("/web/dataset/call_kw/purchase.order/search_read", {
       model: "purchase.order", method: "search_read",
-      args: [], kwargs: { domain: [[ODOO_FIELDS.poRef, "=", ref]], fields: ["id", "name", "order_line"] }
+      args: [], kwargs: { domain: [[ODOO_FIELDS.poRef, "=", ref]], fields: ["id", "name", "partner_id", "order_line"] }
     })
     if (!result || result.length === 0) return null
-    return { id: result[0].id, orderLineIds: result[0].order_line }
+    return { id: result[0].id, partnerId: result[0].partner_id && result[0].partner_id.length ? result[0].partner_id[0] : null, orderLineIds: result[0].order_line }
   }
 
   // 批量取订单行（v1.9 匹配键改造：UPC = product.default_code，包装 = product.packaging 的 qty）
   // 一个 UPC 可能对应多个包装不同的品，需 UPC + 包装双重匹配（用户 2026-08-20 需求）
   // v3.0：补读 price_subtotal（套装小计，价格比对原值用）
-  async function getOrderLines(ids) {
+  // v3.7（2026-09-04 用户需求）：二级匹配键 = supplierinfo.product_code——按 PO 供应商（partnerId）查该产品
+  // 的供应商产品编码（部分产品 default_code 改过号，供应商票据 UPC 只存在 supplierinfo 里，2026-09-04 只读库实测）
+  async function getOrderLines(ids, partnerId) {
     var result = await rpcCall("/web/dataset/call_kw/purchase.order.line/search_read", {
       model: "purchase.order.line", method: "search_read",
       args: [], kwargs: {
@@ -257,13 +260,16 @@
       if (result[i].product_id && result[i].product_id.length) productIds.push(result[i].product_id[0])
       if (result[i].product_packaging_id && result[i].product_packaging_id.length) packIds.push(result[i].product_packaging_id[0])
     }
-    var codeMap = {}, packMap = {}
+    var codeMap = {}, packMap = {}, tmplOf = {}, supTmplCodes = {}, supProductCodes = {}
     if (productIds.length) {
       var prods = await rpcCall("/web/dataset/call_kw/product.product/search_read", {
         model: "product.product", method: "search_read",
-        args: [], kwargs: { domain: [["id", "in", productIds]], fields: ["id", "default_code"] }
+        args: [], kwargs: { domain: [["id", "in", productIds]], fields: ["id", "default_code", "product_tmpl_id"] }
       })
-      for (var p = 0; p < prods.length; p++) codeMap[prods[p].id] = prods[p].default_code || ""
+      for (var p = 0; p < prods.length; p++) {
+        codeMap[prods[p].id] = prods[p].default_code || ""
+        if (prods[p].product_tmpl_id) tmplOf[prods[p].id] = prods[p].product_tmpl_id[0]
+      }
     }
     if (packIds.length) {
       var packs = await rpcCall("/web/dataset/call_kw/product.packaging/search_read", {
@@ -272,16 +278,72 @@
       })
       for (var q = 0; q < packs.length; q++) packMap[packs[q].id] = { qty: packs[q].qty, name: packs[q].name || "" }
     }
+    // v3.7：查 supplierinfo.product_code（模板级 + 变体级，均限该 PO 供应商），供二级匹配用
+    if (partnerId) {
+      var tmplIds = [], seenTmpl = {}
+      for (var t = 0; t < productIds.length; t++) {
+        var tid = tmplOf[productIds[t]]
+        if (tid && !seenTmpl[tid]) { seenTmpl[tid] = true; tmplIds.push(tid) }
+      }
+      if (tmplIds.length) {
+        try {
+          var sis = await rpcCall("/web/dataset/call_kw/product.supplierinfo/search_read", {
+            model: "product.supplierinfo", method: "search_read",
+            args: [], kwargs: { domain: [["product_tmpl_id", "in", tmplIds], ["partner_id", "=", partnerId]], fields: ["id", "product_tmpl_id", "product_code"] }
+          })
+          for (var s = 0; s < sis.length; s++) {
+            var sc = (sis[s].product_code || "").trim()
+            if (!sc) continue
+            var tk = sis[s].product_tmpl_id && sis[s].product_tmpl_id.length ? sis[s].product_tmpl_id[0] : null
+            if (tk) {
+              if (!supTmplCodes[tk]) supTmplCodes[tk] = {}
+              supTmplCodes[tk][sc] = true
+            }
+          }
+        } catch (e) {
+          console.error("[Odoo Excel Importer] supplierinfo(模板级) 查询失败 partner=" + partnerId, e)
+        }
+      }
+      if (productIds.length) {
+        try {
+          var sip = await rpcCall("/web/dataset/call_kw/product.supplierinfo/search_read", {
+            model: "product.supplierinfo", method: "search_read",
+            args: [], kwargs: { domain: [["product_id", "in", productIds], ["partner_id", "=", partnerId]], fields: ["id", "product_id", "product_code"] }
+          })
+          for (var sp = 0; sp < sip.length; sp++) {
+            var pc2 = (sip[sp].product_code || "").trim()
+            if (!pc2) continue
+            var pk2 = sip[sp].product_id && sip[sp].product_id.length ? sip[sp].product_id[0] : null
+            if (pk2) {
+              if (!supProductCodes[pk2]) supProductCodes[pk2] = {}
+              supProductCodes[pk2][pc2] = true
+            }
+          }
+        } catch (e) {
+          console.error("[Odoo Excel Importer] supplierinfo(变体级) 查询失败 partner=" + partnerId, e)
+        }
+      }
+    }
     return result.map(function (r) {
-      // UPC = product.default_code（用户指定字段）；为空时用 name 中 [数字] 兜底（旧数据兼容）
+      // UPC 主键 = product.default_code（用户指定字段）；为空时用 name 中 [数字] 兜底（旧数据兼容）
       var code = (r.product_id && r.product_id.length) ? (codeMap[r.product_id[0]] || "") : ""
       if (!code) {
         var m = r.name.match(/\[(\d+)\]/)
         code = m ? m[1] : ""
       }
       var pk = (r.product_packaging_id && r.product_packaging_id.length) ? packMap[r.product_packaging_id[0]] : null
+      // v3.7：二级候选键 = 该 PO 供应商下 supplierinfo.product_code（模板/变体级并集），排除与主键重复
+      var pid = (r.product_id && r.product_id.length) ? r.product_id[0] : null
+      var supCodes = {}
+      if (pid) {
+        var tMid = tmplOf[pid]
+        if (tMid && supTmplCodes[tMid]) for (var c1 in supTmplCodes[tMid]) supCodes[c1] = true
+        if (supProductCodes[pid]) for (var c2 in supProductCodes[pid]) supCodes[c2] = true
+        delete supCodes[code]
+      }
       return {
         id: r.id, name: r.name, defaultCode: code,
+        supplierCodes: Object.keys(supCodes),
         packQty: (pk && pk.qty !== null && pk.qty !== undefined && pk.qty !== "") ? String(pk.qty) : "",
         packName: pk ? pk.name : "",
         price_unit: r.price_unit, box_wholesale_price: r.box_wholesale_price,
@@ -610,11 +672,11 @@
     return Math.abs(parseFloat(a) - parseFloat(b)) < 0.001
   }
 
-  // ×0.9 因子：factor=1 原值；factor=0.9 乘 0.9（整数分）
+  // ×0.9 因子：factor=1 原值；factor=0.9 乘 0.9（v3.5：两者都精确到 2 位小数四舍五入）
   function applyFactor(val, factor) {
     var n = parseFloatNum(val)
     if (n === null) return null
-    if (factor === 1) return n
+    if (factor === 1) return Math.round(n * 100) / 100
     return calcBoxPrice(n)
   }
 
@@ -709,6 +771,18 @@
         })
       }
       fields.push(unitField)
+      // 0.9总价（v3.6，2026-09-04 用户需求）：单件入口同样展示 = 单价 × 包装数量（不写回，随编辑动态重算）
+      // 用 unitField.newValue（缺货②已置 0）；包装数量空按 0；PDF 无价格 → null（输入框留空）
+      var boxQ09 = (ex.boxQty == null) ? 0 : ex.boxQty
+      var newTotal09 = (unitField.newValue === null) ? null : Math.round(unitField.newValue * boxQ09 * 100) / 100
+      fields.push({
+        key: "total09", label: "0.9总价", odooField: null,
+        oldValue: null, newValue: newTotal09, changed: false,
+        expr: newTotal09 !== null ? factorExpr(unit, factor) + " × 包装数量 " + boxQ09 : null,
+        pdfSource: newTotal09 !== null ? "计算: 单价(" + unitField.newValue + ") × 包装数量(" + boxQ09 + ") = " + newTotal09 : "",
+        reason: null,
+        pdfRaw: pdfRaw
+      })
       // v3.3：UPC 匹配成功（SKU 匹配失败）→ SKU 已变更，用转换 Excel 的 SKU（pdf.catalog）更新 Odoo piece 规格的 single_sku
       var skuUpd = null
       if (pair.matchLevel === "upc" && p.catalog) {
@@ -732,7 +806,9 @@
         qtyTarget: null, qtySum: null, qtyMismatch: false,
         fields: [
           { key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock },
-          { key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice, oldValue: er.unitPrice, newValue: 0, changed: true, pdfSource: "缺货置 0", reason: REASONS.outstockZero },
+          // v3.7.1（2026-09-04 修复）：oldValue 不再放 Excel 单价列残留值（v3.0 起 Excel 价格列不作比对基准；
+          // kind=outstock 又不回填 Odoo 现值 → 旧值会以「Odoo 原值」小字残留显示，误导：Odoo 已写 0 仍见非 0）
+          { key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice, oldValue: null, newValue: 0, changed: true, pdfSource: "缺货置 0", reason: REASONS.outstockZero },
           { key: "boxWholesale", label: "整箱批发价", odooField: ODOO_FIELDS.boxWholesalePrice, oldValue: null, newValue: 0, changed: true, pdfSource: "缺货置 0", reason: REASONS.outstockZero }
         ]
       })
@@ -757,7 +833,6 @@
       // 套装单件数量：PDF PRODUCT DESCRIPTION "x30" → 降级 Excel 包装列 pieces
       var pieces = parseSetPieces(p.description, ex.pack)
       var unit = parseFloatNum(p.unitPrice)
-      var sub = parseFloatNum(p.subtotal)
       // PDF 原始字段（悬浮提示第一行，2026-08-18 用户需求）
       var pdfRaw = ["UPC=" + p.upc, "QTY=" + p.qty, "UNIT PRICE=" + p.unitPrice, "Subtotal=" + p.subtotal].join(" | ")
       if (pieces && pieces > 0) pdfRaw += " | 套装单件数量=" + pieces
@@ -771,11 +846,12 @@
       // v3.0：箱规价字段已移除（用户确认：Odoo 无对应字段，不再展示）；价格原值改由 Odoo 回填
 
       // 单价 = UNIT PRICE × factor ÷ 套装单件数量 → price_unit；原值由 Odoo price_unit 回填（v3.0）
+      // v3.5：精确到 2 位小数四舍五入
       var newUnit = null, unitExpr = null
       if (unit !== null) {
         unitExpr = factorExpr(unit, factor) + (pieces && pieces > 0 ? "÷" + pieces : "")
         newUnit = unit * factor
-        if (pieces && pieces > 0) newUnit = Math.round((newUnit / pieces) * 10000) / 10000
+        if (pieces && pieces > 0) newUnit = Math.round((newUnit / pieces) * 100) / 100
         else newUnit = null
       }
       var unitField = {
@@ -812,12 +888,15 @@
       }
       fields.push(box09Field)
 
-      // 0.9总价 = Subtotal × factor（不写回，仅比对）；原值由 Odoo price_subtotal 回填（v3.0）
-      var newTotal09 = applyFactor(sub, factor)
+      // 0.9总价（v3.6，2026-09-04 用户需求）：动态 = 0.9箱规价 × 包装数量（不写回，仅展示；随 modal 编辑实时重算）
+      // 用 box09Field.newValue（缺货②已置 0），包装数量空按 0；无价格 → null（输入框留空）
+      var boxQ09 = (ex.boxQty == null) ? 0 : ex.boxQty
+      var newTotal09 = (box09Field.newValue === null) ? null : Math.round(box09Field.newValue * boxQ09 * 100) / 100
       fields.push({
         key: "total09", label: "0.9总价", odooField: null,
-        oldValue: null, newValue: newTotal09, changed: false, expr: factorExpr(sub, factor),
-        pdfSource: newTotal09 !== null ? "PDF: " + factorExpr(sub, factor) + " = " + newTotal09 : "",
+        oldValue: null, newValue: newTotal09, changed: false,
+        expr: newTotal09 !== null ? factorExpr(unit, factor) + " × 包装数量 " + boxQ09 : null,
+        pdfSource: newTotal09 !== null ? "计算: 0.9箱规价(" + box09Field.newValue + ") × 包装数量(" + boxQ09 + ") = " + newTotal09 : "",
         reason: null,
         pdfRaw: pdfRaw
       })
@@ -846,7 +925,9 @@
         qtyTarget: null, qtySum: null, qtyMismatch: false,
         fields: [
           { key: "remark", label: "备注", odooField: ODOO_FIELDS.remark, oldValue: "", newValue: "缺货", changed: true, reason: REASONS.outstock },
-          { key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice, oldValue: er.unitPrice, newValue: 0, changed: true, pdfSource: "缺货置 0", reason: REASONS.outstockZero },
+          // v3.7.1（2026-09-04 修复）：oldValue 不再放 Excel 单价列残留值（v3.0 起 Excel 价格列不作比对基准；
+          // kind=outstock 又不回填 Odoo 现值 → 旧值会以「Odoo 原值」小字残留显示，误导：Odoo 已写 0 仍见非 0）
+          { key: "unitPrice", label: "单价", odooField: ODOO_FIELDS.unitPrice, oldValue: null, newValue: 0, changed: true, pdfSource: "缺货置 0", reason: REASONS.outstockZero },
           { key: "boxWholesale", label: "整箱批发价", odooField: ODOO_FIELDS.boxWholesalePrice, oldValue: null, newValue: 0, changed: true, pdfSource: "缺货置 0", reason: REASONS.outstockZero }
         ]
       })
@@ -2113,8 +2194,11 @@
   // 查 PO → 订单行，构建 lineMap（v1.9：key = ref|defaultCode 兜底 + ref|defaultCode|包装件数 精确）
   // 2026-08-19：每行优先用「参考号」查 PO（两者都查 Odoo name 字段），查不到再用「订单关联」；命中行按两个键都注册
   // 返回 { map: 行查找表, cnt: ref|defaultCode 出现次数 }——包装匹配失败时按 cnt 判断是否唯一可兜底（避免错配同 UPC 其他包装行）
+  // v3.7（2026-09-04 用户需求）：二级索引 supMap/supCnt = ref|supplierinfo.product_code（按 PO 供应商过滤，
+  // 只读库实测：部分产品 default_code 改过号，票据 UPC 仅存在于 supplierinfo.product_code，主键匹配不上时用它兜底）
   async function loadOrderLineMap(refPairs) {
     var lineMap = {}, cnt = {}
+    var supMap = {}, supCnt = {}
     for (var r = 0; r < refPairs.length; r++) {
       var orderRef = refPairs[r].orderRef, partnerRef = refPairs[r].partnerRef
       try {
@@ -2122,17 +2206,30 @@
         if (partnerRef) po = await searchPoByRef(partnerRef)   // 先匹配参考号
         if (!po && orderRef) po = await searchPoByRef(orderRef) // 查不到再匹配订单关联
         if (po && po.orderLineIds.length) {
-          var lines = await getOrderLines(po.orderLineIds)
+          var lines = await getOrderLines(po.orderLineIds, po.partnerId)
           var refs = []
           if (orderRef) refs.push(orderRef)
           if (partnerRef && partnerRef !== orderRef) refs.push(partnerRef)
           for (var j = 0; j < lines.length; j++) {
-            if (!lines[j].defaultCode) continue
+            var ln = lines[j]
+            var hasMain = !!ln.defaultCode
+            var hasSup = !!(ln.supplierCodes && ln.supplierCodes.length)
+            if (!hasMain && !hasSup) continue
             for (var x = 0; x < refs.length; x++) {
-              var k0 = refs[x] + "|" + lines[j].defaultCode
-              cnt[k0] = (cnt[k0] || 0) + 1
-              lineMap[k0] = lines[j]
-              if (lines[j].packQty !== "") lineMap[k0 + "|" + lines[j].packQty] = lines[j]
+              // 主键：default_code（原逻辑）
+              if (hasMain) {
+                var k0 = refs[x] + "|" + ln.defaultCode
+                cnt[k0] = (cnt[k0] || 0) + 1
+                lineMap[k0] = ln
+                if (ln.packQty !== "") lineMap[k0 + "|" + ln.packQty] = ln
+              }
+              // 次键：supplierinfo.product_code（v3.7）
+              for (var sc = 0; sc < ln.supplierCodes.length; sc++) {
+                var sk0 = refs[x] + "|" + ln.supplierCodes[sc]
+                supCnt[sk0] = (supCnt[sk0] || 0) + 1
+                supMap[sk0] = ln
+                if (ln.packQty !== "") supMap[sk0 + "|" + ln.packQty] = ln
+              }
             }
           }
         }
@@ -2140,7 +2237,7 @@
         console.error("[Odoo Excel Importer] 查询失败 " + (partnerRef || orderRef), e)
       }
     }
-    return { map: lineMap, cnt: cnt }
+    return { map: lineMap, cnt: cnt, supMap: supMap, supCnt: supCnt }
   }
 
   // 预览 Odoo 查询缓存（v1.12.3，2026-08-25 用户需求）：同一 changes 数组（引用相同）重复预览时
@@ -2220,6 +2317,8 @@
   // - Excel 无包装件数 → 仅当该 UPC 在 PO 中唯一时按 UPC 命中；多行 → 报未找到
   function buildPreviewRows(changes, lineData, packMap) {
     var lineMap = lineData.map, cnt = lineData.cnt || {}
+    // v3.7：二级索引（supplierinfo.product_code，按 PO 供应商过滤）——主键 default_code 匹配不上时兜底
+    var supMap = lineData.supMap || {}, supCnt = lineData.supCnt || {}
     var previewRows = []
     for (var k = 0; k < changes.length; k++) {
       var c = changes[k]
@@ -2237,6 +2336,17 @@
         // 精确包装匹配不到（或 Excel 无包装件数）：仅当该 UPC 在 PO 中唯一时按 UPC 兜底
         if (cnt[k0] === 1) { line = lineMap[k0] || null; break }
         if (cnt[k0] > 1) break
+      }
+      // v3.7：主键未命中 → 二级匹配 supplierinfo.product_code（同样支持包装精确 + UPC 唯一兜底 + 多行防错配）
+      for (var rr2 = 0; rr2 < refs.length && !line; rr2++) {
+        var ref2 = refs[rr2]
+        var sk0 = ref2 + "|" + c.upc
+        if (c.packQty) {
+          line = supMap[ref2 + "|" + c.upc + "|" + c.packQty] || null
+          if (line) break
+        }
+        if (supCnt[sk0] === 1) { line = supMap[sk0] || null; break }
+        if (supCnt[sk0] > 1) break
       }
       // v3.0（2026-08-26 用户需求）：价格原值从 Odoo 订单行取（单价→price_unit、0.9箱规价→box_wholesale_price、0.9总价→price_subtotal）
       // 缺货行（kind=outstock）价格已定死（置 0），不参与回填
@@ -2313,9 +2423,11 @@
   // 字段展示顺序（按入口；2026-08-19 起 Excel 流与 PDF 流同一布局，source 仅保留兼容签名）
   // v3.0：去掉箱规价（用户确认：Odoo 无对应字段，不再展示）
   // v3.1.1：去掉整箱批发价列（用户确认 2026-08-27；缺货行 boxWholesale 字段仍保留在 fields 里，置 0 写回不受影响）
+  // v3.6（2026-09-04）：0.9总价列两入口都展示（套装=0.9箱规价×包装数量、单件=单价×包装数量，动态只读列）
   function fieldOrder(mode, source) {
     var order = ["boxQty", "unitPrice"]
-    if (mode === "set") order = order.concat(["boxPrice09", "total09"])
+    if (mode === "set") order = order.concat(["boxPrice09"])
+    order.push("total09")
     return order.concat(["remark"])
   }
 
@@ -2332,6 +2444,14 @@
   function fieldDisplayVal(f) {
     var v = f.changed ? f.newValue : f.oldValue
     return (v === null || v === undefined || v === "") ? "" : String(v)
+  }
+
+  // v3.6.1（2026-09-04）：字段初值/列宽口径 = 计算值 newValue 优先（Odoo 匹配不上的行 oldValue 无回填，
+  // 也要能显示计算出的价格/0.9总价，只是无法比对 Odoo 原值）；无计算值再退回 fieldDisplayVal（Odoo 原值或空）
+  function fieldInitValue(f) {
+    return (f.newValue !== null && f.newValue !== undefined && f.newValue !== "")
+      ? String(f.newValue)
+      : fieldDisplayVal(f)
   }
 
   // source: 'pdf' | 'excel'（2026-08-18 双流共用：Excel 流无 PDF 比对，标题/字段列布局按 source 区分）
@@ -2441,14 +2561,15 @@
     thead.appendChild(tr)
     table.appendChild(thead)
 
-    // 输入框宽度自适应：以该列最长数值为基准（最少 7 位数字），2026-08-18 用户要求
+    // 输入框宽度自适应：以该列最长显示值为基准（最少 7 位数字），2026-08-18 用户要求
+    // v3.6.1：长度按 fieldInitValue（计算值优先）统计——Odoo 匹配不上的行价格也能撑开列宽
     var colMaxLen = {}
     for (var ci = 0; ci < order.length; ci++) colMaxLen[order[ci]] = 7
     for (var rj = 0; rj < previewRows.length; rj++) {
       var flds = previewRows[rj].fields
       for (var fj = 0; fj < flds.length; fj++) {
         var ff = flds[fj]
-        var ln = String(fieldDisplayVal(ff)).length
+        var ln = fieldInitValue(ff).length
         if (ln > colMaxLen[ff.key]) colMaxLen[ff.key] = ln
       }
     }
@@ -2664,16 +2785,30 @@
         var changed = f.changed && !row.error
         var input = document.createElement("input")
         input.type = "text"
-        input.value = fieldDisplayVal(f)
+        // v3.6.1（2026-09-04）：初值一律展示计算值 newValue——Odoo 匹配不上的行（oldValue 无回填、无法比对原值）
+        // 也能看到计算出的价格/0.9总价；无计算值再退回 fieldDisplayVal（Odoo 原值或空）
+        input.value = fieldInitValue(f)
         // 宽度：该列所有行计算值中最多位数者为基底，全列统一；+1ch+14px 余量保证数字完整显示
         var w = (colMaxLen && colMaxLen[key]) || 7
         input.style.cssText = "width:calc(" + (w + 1) + "ch + 14px);padding:5px 6px;border:1px solid " + (changed ? "#fca5a5" : "#d1d5db") +
           ";border-radius:6px;font-size:12px;color:#111827;background:" + (changed ? "#fff5f5" : "#fff") +
           ";box-sizing:border-box;text-align:center"
+        // v3.6：0.9总价 动态计算列——readonly 展示 = 价格 × 包装数量，改数量/价格时自动重算（recalcRowTotal）
+        // v3.7.2：背景/边框的红灰态由 syncTotal09Compare 动态维护（初始 + 实时比对 Odoo price_subtotal），此处仅置只读灰
+        if (key === "total09") {
+          input.readOnly = true
+          input.style.background = "#f3f4f6"
+          input.style.color = "#4b5563"
+          input.style.cursor = "not-allowed"
+          input.title = "0.9总价（动态）= " + (findField(row.fields, "boxPrice09") ? "0.9箱规价 × 包装数量" : "单价 × 包装数量") + "，只读不写回"
+        }
         // 输入框与 Odoo 原值平级（同一行居中，2026-08-18：去掉 PDF 来源小字；v3.0：原值改 Odoo 值）
         var fieldRow = el("div", { style: "display:flex;align-items:center;justify-content:center;gap:8px;white-space:nowrap" })
         fieldRow.appendChild(input)
-        if (changed && f.oldValue !== null && f.oldValue !== undefined && f.oldValue !== "") {
+        // v3.7.2：0.9总价 的「Odoo 原值」小字与红框由 syncTotal09Compare 动态增删（实时比对），不走静态创建
+        if (key === "total09") {
+          row._total09Box = { input: input, rowEl: fieldRow, badge: null, titleDef: input.title }
+        } else if (changed && f.oldValue !== null && f.oldValue !== undefined && f.oldValue !== "") {
           fieldRow.appendChild(el("span", { style: "font-size:10px;color:#9ca3af;text-decoration:line-through" }, "Odoo 原值: " + fmtNum(f.oldValue)))
         }
         ftd.appendChild(fieldRow)
@@ -2701,17 +2836,70 @@
               if (tip) { tip.remove(); tip = null }
             })
           }
-          inp.addEventListener("input", function () { refreshTotal() })
+          // v3.6：改价格/数量 → 先重算本行 0.9总价（动态列），再刷新全表总和与组小计
+          inp.addEventListener("input", function () { recalcRowTotal(row); refreshTotal() })
         })(input, f)
       }
       tr.appendChild(ftd)
     }
+    // v3.7.2：每行渲染完按初始值建立一次 0.9总价 比对态（红框 / Odoo 原值小字）
+    if (row._total09Box) syncTotal09Compare(row)
     return tr
   }
 
   // ── 列总和行（2026-08-18：所有数值列全表合计，随输入框编辑实时刷新）──
   var SUM_KEYS = { boxQty: 1, unitPrice: 1, boxPrice09: 1, total09: 1 }
   var pdfTotalCtx = null
+
+  // v3.6（2026-09-04 用户需求）：0.9总价 = 0.9箱规价(套装)/单价(单件) × 包装数量，随 modal 编辑实时重算
+  // 同步 total09 输入框（只读列）与字段 newValue；价格/数量任一为空 → 留空（null）
+  function recalcRowTotal(row) {
+    if (!row || !row._inputs) return
+    if (!findField(row.fields, "total09")) return
+    var boxInp = row._inputs.boxQty
+    // 套装乘数 = 0.9箱规价；单件（无 boxPrice09 字段）乘数 = 单价
+    var priceKey = findField(row.fields, "boxPrice09") ? "boxPrice09" : "unitPrice"
+    var pInp = row._inputs[priceKey]
+    var tf = findField(row.fields, "total09")
+    if (!boxInp || !pInp || !tf) return
+    var q = parseFloat(boxInp.value)
+    var p = parseFloat(pInp.value)
+    var v = (!isNaN(q) && !isNaN(p)) ? Math.round(p * q * 100) / 100 : null
+    tf.newValue = v
+    if (row._inputs.total09) row._inputs.total09.value = (v === null) ? "" : String(v)
+    // v3.7.2：值已变 → 立即与 Odoo price_subtotal 原值重新比对并刷新红框/小字
+    if (row._total09Box) syncTotal09Compare(row)
+  }
+
+  // v3.7.2（2026-09-04 用户需求）：0.9总价列比对实时化——每次重算后立即与 Odoo price_subtotal
+  // （total09 field.oldValue，命中 Odoo 行时由 buildPreviewRows 回填）重新比对：
+  // 不一致 → 输入框红框红底 + 删除线「Odoo 原值: xx」+ title 说明；一致 → 恢复只读灰样式并移除小字；
+  // 无 Odoo 原值可比对（匹配不上的行 / 缺货①）→ 恒为灰态，只展示计算值
+  function syncTotal09Compare(row) {
+    var box = row && row._total09Box
+    if (!box) return
+    var tf = findField(row.fields, "total09")
+    var inp = box.input
+    var hasOld = !!(tf && tf.oldValue !== null && tf.oldValue !== undefined && tf.oldValue !== "")
+    var v = parseFloat(inp.value)
+    var mismatch = hasOld && !isNaN(v) && !numEq(tf.oldValue, v)
+    if (mismatch) {
+      inp.style.borderColor = "#fca5a5"
+      inp.style.background = "#fff5f5"
+      inp.title = "0.9总价不一致：当前 " + inp.value + " ≠ Odoo 原值 " + fmtNum(tf.oldValue) + "（price_subtotal）"
+      if (!box.badge) {
+        box.badge = el("span", { style: "font-size:10px;color:#9ca3af;text-decoration:line-through" }, "Odoo 原值: " + fmtNum(tf.oldValue))
+        box.rowEl.appendChild(box.badge)
+      } else {
+        box.badge.textContent = "Odoo 原值: " + fmtNum(tf.oldValue)
+      }
+    } else {
+      inp.style.borderColor = "#d1d5db"
+      inp.style.background = "#f3f4f6"
+      inp.title = box.titleDef || ""
+      if (box.badge) { box.badge.remove(); box.badge = null }
+    }
+  }
 
   function refreshTotal() {
     var ctx = pdfTotalCtx
