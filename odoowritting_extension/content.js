@@ -1,5 +1,5 @@
 /**
- * Odoo Excel Importer v3.7.2
+ * Odoo Excel Importer v3.9.1（modal 内包装数量改 0/空 → 该行按缺货写回；供应商数据多选上传；修复 buildFieldCell ASI 缺分号导致预览失败）
  *
  * 可拖动按钮 → 悬浮卡片(上传/标签/日志) → Modal(可最小化)
  */
@@ -367,6 +367,252 @@
   // ═══════════════════════════════════════════
   //  PDF 解析 + 采购订单 Excel 解析 + 匹配修改
   // ═══════════════════════════════════════════
+  // 从文本块数组提取表格（列数动态，关键列按表头名识别；跨页累加；识别有无 HS CODE 两种格式）
+  function extractPdfTable(items) {
+    // 1. 表头行：含 UPC/EAN 关键字的文本块，最小 y（跨页时每页表头 x 坐标一致，取最小 y 即可）
+    var headerCandidates = items.filter(function (i) { return /UPC|EAN/i.test(i.text) })
+    if (!headerCandidates.length) {
+      throw new Error("未识别到表格表头（UPC/EAN）——请确认 PDF 为文本型而非扫描件")
+    }
+    var headerY = Math.min.apply(null, headerCandidates.map(function (i) { return i.y }))
+
+    // 2. 表头行所有文本块（y 容差 4），按 x0 排序
+    var headerRow = items.filter(function (i) { return Math.abs(i.y - headerY) <= 4 })
+      .sort(function (a, b) { return a.x0 - b.x0 })
+    if (!headerRow.length) {
+      throw new Error("表头行文本块提取失败")
+    }
+
+    // 3. 格式识别：表头是否含 HS CODE
+    var hasHsCode = false
+    for (var hh = 0; hh < headerRow.length; hh++) {
+      if (/HS\s*CODE/i.test(headerRow[hh].text)) { hasHsCode = true; break }
+    }
+
+    // 4. 列区间边界 = 相邻标题左边界中点
+    var bounds = []
+    for (var i = 0; i < headerRow.length - 1; i++) {
+      bounds.push((headerRow[i].x0 + headerRow[i + 1].x0) / 2)
+    }
+
+    // 5. 关键列索引（按表头名正则识别，两格式通用）
+    function findCol(re) {
+      for (var i = 0; i < headerRow.length; i++) if (re.test(headerRow[i].text)) return i
+      return -1
+    }
+    var upcCol = findCol(/UPC|EAN/i)
+    var catCol = findCol(/Catalog/i)
+    var qtyCol = findCol(/Qty/i)
+    var priceCol = findCol(/Unit\s*Price/i)
+    var subCol = findCol(/Subtotal/i)
+    var descCol = findCol(/Product\s*Description/i)   // 套装单件数量来源（"x30"）
+    if (upcCol < 0) {
+      throw new Error("表头中未找到 UPC/EAN 列")
+    }
+
+    // 6. x0 归属列
+    function colIndex(x0) {
+      for (var i = 0; i < headerRow.length; i++) {
+        var lo = i > 0 ? bounds[i - 1] : -Infinity
+        var hi = i < bounds.length ? bounds[i] : Infinity
+        if (x0 >= lo && x0 < hi) return i
+      }
+      return headerRow.length - 1
+    }
+
+    // 7. 数据行锚点：UPC 列内的 8~14 位纯数字块（跨页累加所有页）
+    var digitRe = /^\d{8,14}$/
+    var anchors = items.filter(function (i) {
+      return digitRe.test(i.text) && i.y > headerY + 10 && colIndex(i.x0) === upcCol
+    }).sort(function (a, b) { return a.y - b.y })
+    if (!anchors.length) {
+      throw new Error("表头已识别，但未找到 UPC 数据行（UPC 需为 8~14 位纯数字）")
+    }
+
+    // 8. 行聚类（B：行高自适应，2026-08-18）
+    //    行高 = 相邻锚点 y 间距（跨页/异常间距 >120 时沿用上一行高）；
+    //    归属范围 = [a.y - max(8, h*0.4), a.y + h*0.8] —— 下行覆盖 desc 折行，上行防串入上一行 desc 第二行
+    var numishRe = /^[\d\s.,+-]+$/
+    var heights = []
+    for (var ha = 0; ha < anchors.length; ha++) {
+      var hh = ha + 1 < anchors.length ? anchors[ha + 1].y - anchors[ha].y : -1
+      if (hh < 8 || hh > 120) hh = heights.length ? heights[heights.length - 1] : 30
+      heights.push(hh)
+    }
+    var dataRows = []   // 通过假行过滤的 { cells }（粗分：标题中点边界）
+    for (var ai = 0; ai < anchors.length; ai++) {
+      var a = anchors[ai]
+      var h = heights[ai]
+      var rowItems = items.filter(function (i) {
+        return i.y > headerY && i.y >= a.y - Math.max(8, h * 0.4) && i.y <= a.y + h * 0.8
+      })
+      var cells = {}
+      for (var ri = 0; ri < rowItems.length; ri++) {
+        var it = rowItems[ri]
+        var ci = colIndex(it.x0)
+        if (!cells[ci]) cells[ci] = []
+        cells[ci].push(it)
+      }
+      var row = {}
+      for (var ci2 in cells) {
+        cells[ci2].sort(function (x, y) { return x.y - y.y })
+        row[ci2] = cells[ci2].map(function (x) { return x.text }).join(" ")
+      }
+      // 假行过滤：页脚/客户信息文本落入 UPC 列（如 'Phone: 18922477200'）时行内无数据列字段，跳过
+      if (!(row[catCol] || row[qtyCol] || row[priceCol] || row[subCol])) continue
+      dataRows.push({ cells: cells })
+    }
+
+    // 9. 列边界校准（A：内容聚类，2026-08-18）
+    //    表头位置随对齐方式漂移（居中/右对齐），内容位置才是真实列边界。
+    //    列边界 = 相邻两列「内容范围」的间隙中点；空列/内容重叠时用标题中点兜底。
+    var colBlocks = []
+    for (var cb = 0; cb < headerRow.length; cb++) colBlocks.push([])
+    for (var dr = 0; dr < dataRows.length; dr++) {
+      var drc = dataRows[dr].cells
+      for (var dc in drc) {
+        var dcNum = parseInt(dc, 10)
+        for (var dbi = 0; dbi < drc[dc].length; dbi++) colBlocks[dcNum].push(drc[dc][dbi])
+      }
+    }
+    // desc 列粗分为空（标题与内容错位时 desc 被粗分进相邻列）→ 从相邻列摘除「含字母」块补入 desc 列
+    if (descCol >= 0 && colBlocks[descCol].length === 0) {
+      for (var si = -1; si <= 1; si += 2) {
+        var sCol = descCol + si
+        if (sCol < 0 || sCol >= colBlocks.length) continue
+        var kept = []
+        for (var sb = 0; sb < colBlocks[sCol].length; sb++) {
+          var sblk = colBlocks[sCol][sb]
+          if (/[A-Za-z]/.test(sblk.text) && !numishRe.test(sblk.text)) colBlocks[descCol].push(sblk)
+          else kept.push(sblk)
+        }
+        colBlocks[sCol] = kept
+      }
+    }
+    var colRange = []
+    for (var cr = 0; cr < colBlocks.length; cr++) {
+      var minX0 = Infinity, maxX1 = -Infinity
+      for (var cbi = 0; cbi < colBlocks[cr].length; cbi++) {
+        var blk = colBlocks[cr][cbi]
+        if (blk.x0 < minX0) minX0 = blk.x0
+        if (blk.x1 > maxX1) maxX1 = blk.x1
+      }
+      colRange.push({ minX0: minX0, maxX1: maxX1, empty: colBlocks[cr].length === 0 })
+    }
+    var newBounds = []
+    for (var nb = 0; nb < bounds.length; nb++) {
+      var lo = colRange[nb].empty ? bounds[nb] : colRange[nb].maxX1
+      var hi = colRange[nb + 1].empty ? bounds[nb] : colRange[nb + 1].minX0
+      newBounds.push(lo < hi ? (lo + hi) / 2 : bounds[nb])
+    }
+    function colIndex2(x0) {
+      for (var i = 0; i < headerRow.length; i++) {
+        var lo = i > 0 ? newBounds[i - 1] : -Infinity
+        var hi = i < newBounds.length ? newBounds[i] : Infinity
+        if (x0 >= lo && x0 < hi) return i
+      }
+      return headerRow.length - 1
+    }
+
+    // 10. 按新列边界重新归属
+    var rows = []
+    for (var rr = 0; rr < dataRows.length; rr++) {
+      var src = dataRows[rr].cells
+      var cells2 = {}
+      for (var sc in src) {
+        for (var sbi = 0; sbi < src[sc].length; sbi++) {
+          var blk2 = src[sc][sbi]
+          var ci2b = colIndex2(blk2.x0)
+          if (!cells2[ci2b]) cells2[ci2b] = []
+          cells2[ci2b].push(blk2)
+        }
+      }
+      var row2 = {}
+      for (var ci4 in cells2) {
+        cells2[ci4].sort(function (x, y) { return x.y - y.y })
+        row2[ci4] = cells2[ci4].map(function (x) { return x.text }).join(" ")
+      }
+      // desc 兜底（保险）：重新归属后 desc 列仍空时，从相邻列逐块取含字母文本合并
+      var descText = (row2[descCol] || "").trim()
+      if (!descText && descCol >= 0) {
+        var parts = []
+        for (var ci5 in row2) {
+          var cnum = parseInt(ci5, 10)
+          if (cnum === descCol || Math.abs(cnum - descCol) > 1) continue
+          var blocks = cells2[ci5] || []
+          for (var bi2 = 0; bi2 < blocks.length; bi2++) {
+            var bt = blocks[bi2].text
+            if (/[A-Za-z]/.test(bt) && !numishRe.test(bt)) parts.push(bt)
+          }
+        }
+        descText = parts.join(" ")
+      }
+      row2.__desc = descText
+      rows.push(row2)
+    }
+
+    // 11. 输出：格式 + Coupon + 关键列
+    return {
+      format: hasHsCode ? "B" : "A",
+      coupon: extractCoupon(items),
+      rows: rows.map(function (r) {
+        return {
+          upc: (r[upcCol] || "").trim(),
+          catalog: (r[catCol] || "").trim(),
+          qty: (r[qtyCol] || "").trim(),
+          unitPrice: (r[priceCol] || "").trim(),
+          subtotal: (r[subCol] || "").trim(),
+          description: r.__desc || ""
+        }
+      })
+    }
+  }
+
+  // 从汇总区提取 Coupon 值（决定是否 ×0.9）
+  function extractCoupon(items) {
+    var blocks = items.filter(function (i) { return /^Coupon$/i.test(i.text) })
+    if (!blocks.length) return 0
+    var c = blocks[0]
+    var cands = items.filter(function (i) {
+      return Math.abs(i.y - c.y) <= 5 && i.x0 > c.x0 && /^-?\d/.test(i.text)
+    }).sort(function (a, b) { return a.x0 - b.x0 })
+    if (!cands.length) return 0
+    var v = parseFloat(cands[0].text.replace(/[^\d.-]/g, ""))
+    return isNaN(v) ? 0 : v
+  }
+
+  // 用 pdfjs-dist 解析 PDF → 文本块 → 表格
+  async function parsePdf(arrayBuffer) {
+    if (typeof pdfjsLib === "undefined") throw new Error("PDF 解析库未加载")
+    try {
+      if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL) {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js")
+      }
+    } catch (e) {}
+    var task = pdfjsLib.getDocument({ data: arrayBuffer, isEvalSupported: false })
+    var pdf = await task.promise
+    var items = []
+    try {
+      for (var p = 1; p <= pdf.numPages; p++) {
+        var page = await pdf.getPage(p)
+        var viewport = page.getViewport({ scale: 1 })
+        var content = await page.getTextContent()
+        for (var i = 0; i < content.items.length; i++) {
+          var it = content.items[i]
+          var str = (it.str || "").trim()
+          if (!str) continue
+          var vp = viewport.convertToViewportPoint(it.transform[4], it.transform[5])
+          // x1 = 文本右边缘（内容聚类列边界用；pdfjs width 为文本空间宽度，加 transform[4] 即右边缘 x）
+          var vp1 = viewport.convertToViewportPoint(it.transform[4] + (it.width || 0), it.transform[5])
+          // 页偏移：多页时各页 y 从 0 起，加 (page-1)*1000 使全局 y 单调递增，避免跨页坐标重叠
+          items.push({ text: str, x0: vp[0], x1: vp1[0], y: vp[1] + (p - 1) * 1000, page: p })
+        }
+      }
+    } finally {
+      pdf.destroy()
+    }
+    return extractPdfTable(items)
+  }
 
   // 按列名解析采购订单 Excel（列顺序动态）
   // v3.4（2026-08-27 用户需求）：SKU 列按入口区分——单件用「订单行/包装/SKU」，套装用「订单行/包装/Box SKU」
@@ -491,7 +737,7 @@
       }
       if (headerIdx >= 0) break
     }
-    if (headerIdx < 0) throw new Error("未识别到表格表头（UPC/EAN）——请确认上传的是 PDF 转换版 Excel")
+    if (headerIdx < 0) throw new Error("未识别到表格表头（UPC/EAN）——请确认上传的是供应商 Excel（PDF 转换版）或文本型 PDF")
 
     // 2. 格式识别（有无 HS CODE）+ 关键列定位
     var header = (grid[headerIdx] || []).map(function (h) { return s(h) })
@@ -505,7 +751,7 @@
     }
     var upcCol = findCol(/UPC|EAN/i)
     var catCol = findCol(/Catalog/i)
-    var qtyCol = findCol(/Qty/i)
+    var qtyCol = findCol(/Qty|Quantity|QTY|QTYs/i)   // v1.20.3：供应商 Excel 的 qty 列兼容 Qty/QTY/Quantity/QTYs 等多种英文表头变体
     var priceCol = findCol(/Unit\s*Price/i)
     var subCol = findCol(/Subtotal/i)
     var descCol = findCol(/Product\s*Description/i)
@@ -547,7 +793,7 @@
     return { format: hasHsCode ? "B" : "A", coupon: coupon, rows: rows }
   }
 
-  // ── 多转换版 Excel 合并（v1.12.0，2026-08-25 用户需求）──
+  // ── 多供应商数据文件合并（v1.12.0，2026-08-25 用户需求；v3.8 起 Excel 与 PDF 两种来源文件统一合并）──
   // 同 UPC+包装去重（key 与 matchPdfToExcel 拆分键一致：UPC+description 的 "(xN)"，提取不到 = 原 UPC）；
   // 合并行 Qty 相加、Subtotal 相加（价格×箱数才与 0.9总价比对一致），UNIT PRICE/catalog/description 取第一个
   function mergeConvFiles(files) {
@@ -759,6 +1005,7 @@
       }
       // v1.12.4（2026-08-26 用户需求）：缺货行（两入口统一）单价/整箱批发价置 0 写回，取代 v1.8.0 的 Excel 入口不写回
       if (outstock) {
+        unitField.calcValue = unitField.newValue   // v3.9：保留计算值，供 modal 里把包装数量改回非 0 时还原
         unitField.newValue = 0
         unitField.changed = true
         unitField.pdfSource = "缺货置 0"
@@ -863,6 +1110,7 @@
       }
       // v1.12.4（2026-08-26 用户需求）：缺货行（两入口统一）单价置 0 写回，取代 v1.8.0 的 Excel 入口不写回
       if (outstock) {
+        unitField.calcValue = unitField.newValue   // v3.9：保留计算值，供 modal 里把包装数量改回非 0 时还原
         unitField.newValue = 0
         unitField.changed = true
         unitField.pdfSource = "缺货置 0"
@@ -982,7 +1230,7 @@
   // ═══════════════════════════════════════════
   var appState = {
     cardOpen: false,
-    activeTab: isProductPage() ? "product" : "excel"   // 'excel' | 'product'（商品库更新，v1.11.0；产品页默认商品库 Tab）
+    activeTab: isProductPage() ? "product" : "excel"   // 'excel'(供应商数据导入) | 'product'(商品库更新)；产品页默认商品库 Tab
   }
 
   // 修正入口模式（单件 / 套装，处理逻辑区分；Excel 导入流用）
@@ -991,10 +1239,11 @@
     set:    { id: "set",    label: "套装入口", icon: "🎁", desc: "按套装组合匹配修正" }
   }
 
-  // Excel 导入区流程状态（2026-08-19 改造：上传「PDF 转换版 Excel」→ 再传采购订单 Excel → 与 PDF 流同逻辑比对写回）
+  // 供应商数据导入区流程状态（v3.8：步骤1 上传供应商数据——Excel 或 PDF 自动识别路由解析；
+  // v1.12.0 起支持多文件合并；随后仍上传采购订单 Excel → 与 PDF 流同逻辑比对写回）
   var excelState = {
     mode: null,          // 入口: null | 'single' | 'set'
-    convFiles: [],       // 已添加的转换版文件 [{name, rows, format, coupon}]（v1.12.0 多文件）
+    convFiles: [],       // 已添加的供应商数据文件 [{name, kind, rows, format, coupon}]（kind: 'pdf' | 'excel'，v3.8）
     convRows: null,      // 合并去重后的表格数据行（点「下一步」时由 mergeConvFiles 生成）
     convFileName: null,  // 展示用：全部文件名（", " 连接）
     convFormat: null,    // 展示用：格式（多文件混合时取第一个文件的）
@@ -1115,7 +1364,7 @@
       btn.style.cursor = "grab"
       btn.textContent = "📥"
       var file = e.dataTransfer.files[0]
-      if (file) showToast("请在卡片内选择入口上传文件（📊 Excel 导入 / 🏷 商品库更新）", "info")
+      if (file) showToast("请在卡片内选择入口上传文件（🗂 供应商数据导入 / 🏷 商品库更新）", "info")
     })
 
     return btn
@@ -1233,8 +1482,8 @@
     var tab = appState.activeTab
     var isExcelTab = tab === "excel"
     var isProductTab = tab === "product"
-    // 标题：商品库更新 / Excel 导入（含当前入口徽章，商品库无入口概念）
-    var titleText = isProductTab ? "商品库更新" : "Excel 导入"
+    // 标题：商品库更新 / 供应商数据导入（含当前入口徽章，商品库无入口概念）
+    var titleText = isProductTab ? "商品库更新" : "供应商数据导入"
     if (!isProductTab && excelState.mode) {
       var m = PDF_MODES[excelState.mode]
       titleText += " · " + m.label
@@ -1254,7 +1503,7 @@
       }, "✕")
     ]))
 
-    // Tab 栏：📊 Excel 导入 / 🏷 商品库更新（v1.11.0；v3.2 去掉 PDF 修正）
+    // Tab 栏：🗂 供应商数据导入 / 🏷 商品库更新（v3.8：步骤1 统一上传供应商数据，Excel/PDF 自动识别路由）
     frag.appendChild(renderTabSwitch())
 
     // 内容区（按 Tab 路由）+ 日志区（v1.12.1：包可滚动容器 flex:1，文件列表超出卡片高度时内容区出现滚动条，Header/Tab 固定）
@@ -1276,12 +1525,12 @@
   }
 
   // ═══════════════════════════════════════════
-  //  3. Tab 栏（📊 Excel 导入 / 🏷 商品库更新，2026-08-18 双 Tab；v3.2 去掉 PDF 修正）
+  //  3. Tab 栏（🗂 供应商数据导入 / 🏷 商品库更新；v3.8 起步骤1 统一收供应商数据，Excel/PDF 自动识别）
   // ═══════════════════════════════════════════
   function renderTabSwitch() {
     var bar = el("div", { style: "display:flex;padding:10px 16px 0;gap:8px" })
     var tabs = [
-      { id: "excel", label: "📊 Excel 导入" },
+      { id: "excel", label: "🗂 供应商数据导入" },
       { id: "product", label: "🏷 商品库更新" }
     ]
     for (var i = 0; i < tabs.length; i++) {
@@ -1333,26 +1582,58 @@
   function fileTypeOk(name, accept) {
     var ext = fileExt(name)
     if (accept === "pdf") return ext === "pdf"
+    if (accept === "supplier") return ext === "pdf" || ext === "xlsx" || ext === "xls"   // v3.8：供应商数据 = Excel 或 PDF
     return ext === "xlsx" || ext === "xls"
   }
 
-  function makeDropZone(title, hint, icon, accept, onFile) {
+  // 文件类型提示文案（v3.8：新增 supplier = Excel/PDF 通用上传区）
+  function fileTypeHint(accept, failMsg) {
+    if (accept === "pdf") return failMsg ? "此步骤请上传 PDF" : "请选择 PDF 文件"
+    if (accept === "supplier") return failMsg ? "此步骤请上传供应商数据（.pdf / .xlsx / .xls）" : "请选择供应商数据文件（.pdf / .xlsx / .xls）"
+    return failMsg ? "此步骤请上传 Excel（.xlsx / .xls）" : "请选择 Excel 文件（.xlsx / .xls）"
+  }
+
+  // v3.9（2026-09-10 用户需求）：multi=true → 支持原生多选（selector 多选 / 拖入多个），逐个串行解析
+  function makeDropZone(title, hint, icon, accept, onFile, multi) {
     var zone = el("div", {
       style: "padding:20px;border:2px dashed #d1d5db;border-radius:10px;text-align:center;cursor:pointer;transition:border-color 0.2s,background 0.2s"
     })
+    // 串行处理：onFile 返回 Promise 时等上一个解析完再解析下一个（避免多个 PDF 同时解析卡住页面）
+    function runSeq(files, i) {
+      if (i >= files.length) return
+      var r = onFile(files[i])
+      if (r && typeof r.then === "function") {
+        r.then(function () { runSeq(files, i + 1) }, function () { runSeq(files, i + 1) })
+      } else {
+        runSeq(files, i + 1)
+      }
+    }
+    function handleFiles(fileList) {
+      var files = []
+      for (var i = 0; i < fileList.length; i++) files.push(fileList[i])
+      if (!files.length) return
+      if (!multi) {
+        if (files.length > 1) showToast("该步骤仅支持 1 个文件，已取第一个：" + files[0].name, "info")
+        files = [files[0]]
+      }
+      var good = [], bad = []
+      for (var j = 0; j < files.length; j++) {
+        if (fileTypeOk(files[j].name, accept)) good.push(files[j])
+        else bad.push(files[j].name)
+      }
+      if (bad.length) {
+        showToast((good.length ? "已跳过 " + bad.length + " 个不支持的文件：" : "文件类型不匹配：") + bad.join("、") +
+          (good.length ? "" : "（" + fileTypeHint(accept, true) + "）"), "error")
+      }
+      runSeq(good, 0)
+    }
     zone.addEventListener("click", function () {
       var input = document.createElement("input")
       input.type = "file"
-      input.accept = accept === "pdf" ? ".pdf" : ".xlsx,.xls"
+      if (multi) input.multiple = true
+      input.accept = accept === "pdf" ? ".pdf" : (accept === "supplier" ? ".pdf,.xlsx,.xls" : ".xlsx,.xls")
       input.addEventListener("change", function () {
-        var f = input.files ? input.files[0] : null
-        if (f) {
-          if (!fileTypeOk(f.name, accept)) {
-            showToast(accept === "pdf" ? "请选择 PDF 文件" : "请选择 Excel 文件（.xlsx / .xls）", "error")
-          } else {
-            onFile(f)
-          }
-        }
+        handleFiles(input.files || [])
         input.remove()
       })
       input.click()
@@ -1362,13 +1643,7 @@
     zone.addEventListener("drop", function (e) {
       e.preventDefault()
       zone.style.borderColor = "#d1d5db"; zone.style.background = ""
-      var f = e.dataTransfer.files[0]
-      if (!f) return
-      if (!fileTypeOk(f.name, accept)) {
-        showToast("文件类型不匹配：" + (accept === "pdf" ? "此步骤请上传 PDF" : "此步骤请上传 Excel（.xlsx / .xls）"), "error")
-        return
-      }
-      onFile(f)
+      handleFiles(e.dataTransfer.files || [])
     })
     zone.appendChild(el("div", { style: "font-size:28px;margin-bottom:6px" }, icon))
     zone.appendChild(el("div", { style: "font-size:13px;color:#374151;font-weight:500" }, title))
@@ -1377,8 +1652,8 @@
   }
 
   // ═══════════════════════════════════════════
-  //  3c. Excel 导入区 UI（2026-08-19 改造：与 PDF 流完全一致——
-  //      上传「PDF 转换版 Excel」→ 上传采购订单 Excel → 预览写回）
+  //  3c. 供应商数据导入区 UI（v3.8：步骤1 上传供应商数据——PDF 或 PDF 转换版 Excel 自动识别；
+  //      统一合并 → 上传采购订单 Excel → 预览写回，匹配修正逻辑与 PDF 流完全一致）
   // ═══════════════════════════════════════════
   function renderExcelZone() {
     var wrap = el("div", { style: "margin:12px 16px;display:flex;flex-direction:column;gap:10px" })
@@ -1404,11 +1679,11 @@
       }, "⚠️ " + excelState.error))
     }
 
-    // 步骤指示器：① 上传转换版 Excel → ② 上传采购订单 Excel → ③ 预览确认（已完成步骤可点击回退）
+    // 步骤指示器：① 上传供应商数据（Excel/PDF）→ ② 上传采购订单 Excel → ③ 预览确认（已完成步骤可点击回退）
     if (excelState.mode) {
       var step = excelState.convRows ? (excelState.excelRows ? 3 : 2) : 1
       var steps = [
-        { n: 1, label: "上传转换版 Excel", icon: "📑" },
+        { n: 1, label: "上传供应商数据", icon: "🗂" },
         { n: 2, label: "上传采购订单 Excel", icon: "📊" },
         { n: 3, label: "预览确认", icon: "👁" }
       ]
@@ -1442,7 +1717,7 @@
     if (excelState.convRows) {
       wrap.appendChild(el("div", {
         style: "font-size:12px;color:#059669;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px 10px"
-      }, "✅ 已合并 " + excelState.convFiles.length + " 个转换版文件（" + excelState.convRows.length + " 行，格式" + (excelState.convFormat || "?") + (excelState.coupon ? "，Coupon=" + excelState.coupon : "") + "）"))
+      }, "✅ 已合并 " + excelState.convFiles.length + " 个供应商数据文件（Excel/PDF，" + excelState.convRows.length + " 行，格式" + (excelState.convFormat || "?") + (excelState.coupon ? "，Coupon=" + excelState.coupon : "") + "）"))
     }
     if (excelState.excelRows) {
       wrap.appendChild(el("div", {
@@ -1454,7 +1729,7 @@
       // 步骤0：选择入口（单件 / 套装，与 PDF 区共用选择器）
       wrap.appendChild(renderModePicker(selectExcelMode))
     } else if (!excelState.convRows) {
-      // 步骤1：上传转换版 Excel（可多个，v1.12.0）
+      // 步骤1：上传供应商数据（Excel / PDF 均可，可多个，v1.12.0；v3.8 自动识别文件类型）
       if (excelState.convFiles.length) {
         // 已添加文件列表（可删除单个）
         var listWrap = el("div", { style: "display:flex;flex-direction:column;gap:6px" })
@@ -1463,7 +1738,7 @@
             listWrap.appendChild(el("div", {
               style: "display:flex;justify-content:space-between;align-items:center;font-size:12px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px;padding:6px 10px"
             }, [
-              el("span", { style: "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, "📑 " + f.name + "（" + f.rows.length + " 行）"),
+              el("span", { style: "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, (f.kind === "pdf" ? "📄 " : "📑 ") + f.name + "（" + f.rows.length + " 行）"),
               el("span", {
                 onclick: function () { removeConvFile(i) },
                 title: "删除该文件",
@@ -1474,13 +1749,13 @@
         }
         wrap.appendChild(listWrap)
         // 继续添加 + 下一步（合并）
-        wrap.appendChild(makeDropZone("继续添加转换版 Excel（可选）", "PDF 转成的 Excel（.xlsx / .xls），含 UPC/EAN 表头", "📑", "excel", function (file) { processExcelFile(file) }))
+        wrap.appendChild(makeDropZone("继续添加供应商数据（可选）", "支持 .pdf / .xlsx / .xls，自动识别文件类型并路由解析", "🗂", "supplier", function (file) { processExcelFile(file) }))
         wrap.appendChild(el("button", {
           onclick: function () { finishConvFiles() },
           style: "padding:10px;border:none;border-radius:8px;background:#7c3aed;color:#fff;font-size:13px;font-weight:600;cursor:pointer"
         }, "下一步：上传采购订单 Excel"))
       } else {
-        wrap.appendChild(makeDropZone("点击上传或拖拽转换版 Excel（可多个）", "PDF 转成的 Excel（.xlsx / .xls），含 UPC/EAN 表头，可反复添加", "📑", "excel", function (file) { processExcelFile(file) }))
+        wrap.appendChild(makeDropZone("点击上传或拖拽供应商数据（可多选）", "供应商 PDF（.pdf，文本型）或 PDF 转换版 Excel（.xlsx / .xls），支持一次多选，自动识别并路由解析，也可反复添加", "🗂", "supplier", function (file) { processExcelFile(file) }, true))
       }
     } else if (!excelState.excelRows) {
       // 步骤2：上传采购订单 Excel（匹配规则与 PDF 流一致：SKU 优先、UPC 兜底，v1.7.2）
@@ -2085,6 +2360,8 @@
   //  7. Modal 关闭（最小化/恢复/标签恢复已移除，待 Excel 流程重写后按需恢复）
   // ═══════════════════════════════════════════
   function removeModals() {
+    pdfStatsEl = null
+    pdfTotalCtx = null
     if (currentModalOverlay) {
       currentModalOverlay.remove()
       currentModalOverlay = null
@@ -2093,34 +2370,45 @@
     if (existing) existing.remove()
   }
 
-  // ── Excel 导入流（2026-08-19 改造：与 PDF 流同逻辑；v1.12.0 支持多个转换版文件）──
-  // 步骤1：上传「PDF 转换版 Excel」（可多个）→ 解析后追加到 convFiles（不立即合并，点「下一步」再合并）
+  // ── 供应商数据导入流（v3.8，2026-09-09 用户需求：恢复 PDF 解析；步骤1 上传「供应商数据」）──
+  // 文件类型自动判别：.pdf → PDF 分支 parsePdf（pdfjs）→ extractPdfTable；.xlsx/.xls → Excel 分支 parseConvertedPdfExcel；
+  // 两分支输出同构 {format, coupon, rows}，统一追加到 convFiles（可多个混合，不立即合并，点「下一步」再合并）
+  function detectSupplierKind(file) {
+    var ext = fileExt(file.name)
+    if (ext === "pdf") return "pdf"
+    if (ext === "xlsx" || ext === "xls") return "excel"
+    return ""
+  }
+
+  // 步骤1：上传供应商数据（Excel 或 PDF 均可，可多个）→ 按类型路由解析后追加到 convFiles
   async function processExcelFile(file) {
     try {
-      showToast("解析转换版 Excel 中...", "info")
+      var kind = detectSupplierKind(file)
+      if (!kind) throw new Error("不支持的文件类型：请上传 Excel（.xlsx / .xls）或 PDF（.pdf）")
+      showToast(kind === "pdf" ? "解析供应商 PDF 中..." : "解析供应商 Excel 中...", "info")
       excelState.error = null
       var data = await file.arrayBuffer()
-      var result = parseConvertedPdfExcel(data)
+      var result = (kind === "pdf") ? await parsePdf(data) : parseConvertedPdfExcel(data)
       if (!result.rows.length) {
-        excelState.error = "转换版 Excel 中未找到表格数据（0 行）"
+        excelState.error = (kind === "pdf" ? "PDF" : "Excel") + " 中未找到表格数据（0 行）"
         refreshCard()
         showToast(excelState.error, "error")
         return
       }
-      excelState.convFiles.push({ name: file.name, rows: result.rows, format: result.format, coupon: result.coupon || 0 })
+      excelState.convFiles.push({ name: file.name, kind: kind, rows: result.rows, format: result.format, coupon: result.coupon || 0 })
       excelState.excelRows = null
       excelState.excelFileName = null
       excelState.changes = null
       refreshCard()
-      showToast("已添加 " + file.name + "（" + result.rows.length + " 行，格式" + result.format + "），可继续添加或点「下一步」", "success")
+      showToast("已添加 " + file.name + "（" + (kind === "pdf" ? "PDF" : "Excel") + "，" + result.rows.length + " 行，格式" + result.format + "），可继续添加或点「下一步」", "success")
     } catch (err) {
       // 解析失败：仅提示，不影响已添加的文件
-      showToast("转换版 Excel 解析失败: " + (err.message || String(err)), "error")
-      console.error("[Odoo Excel]", err)
+      showToast("供应商数据解析失败: " + (err.message || String(err)), "error")
+      console.error("[Odoo Supplier]", err)
     }
   }
 
-  // 步骤1「下一步」：合并全部转换版文件 → convRows（含 Coupon 合并、文件名汇总）
+  // 步骤1「下一步」：合并全部供应商数据文件（Excel/PDF 混合也统一合并）→ convRows（含 Coupon 合并、文件名汇总）
   function finishConvFiles() {
     if (!excelState.convFiles.length) return
     excelState.convRows = mergeConvFiles(excelState.convFiles)
@@ -2132,10 +2420,10 @@
     excelState.changes = null
     excelState.error = null
     refreshCard()
-    showToast("已合并 " + excelState.convFiles.length + " 个转换版文件（" + excelState.convRows.length + " 行），请上传采购订单 Excel", "success")
+    showToast("已合并 " + excelState.convFiles.length + " 个供应商数据文件（" + excelState.convRows.length + " 行），请上传采购订单 Excel", "success")
   }
 
-  // 删除已添加的转换版文件（合并结果作废，需重新点「下一步」）
+  // 删除已添加的供应商数据文件（合并结果作废，需重新点「下一步」）
   function removeConvFile(idx) {
     if (idx < 0 || idx >= excelState.convFiles.length) return
     excelState.convFiles.splice(idx, 1)
@@ -2454,6 +2742,220 @@
       : fieldDisplayVal(f)
   }
 
+  // ═══════════════════════════════════════════
+  //  7a-1. Modal 缺货动态切换（v3.9，2026-09-10 用户需求）
+  //  「预览 Modal 里把包装数量改成 0/空」→ 该行按缺货处理：备注「缺货」+ 单价/0.9箱规价置 0 写回（同静态缺货规则）；
+  //  改回非 0 则还原（价格用进入缺货前的快照/计算值回滚）。静态缺货（kind=outstock / 源数据包装数量为 0）不走此通道。
+  // ═══════════════════════════════════════════
+
+  // 缺货判定：源数据缺货行（Excel 有 PDF 无）或 modal 内包装数量被改成空/0
+  // 取数优先用输入框实时值，渲染早期（输入框尚未挂载）退回字段值，口径一致
+  function isRowOutstock(row) {
+    if (!row) return false
+    if (row.kind === "outstock") return true
+    var bf = findField(row.fields || [], "boxQty")
+    if (!bf) return false
+    var inp = row._inputs && row._inputs.boxQty
+    var raw = inp ? inp.value : bf.newValue
+    var v = String(raw === null || raw === undefined ? "" : raw).trim()
+    if (v === "") return true
+    var n = parseFloat(v)
+    return !isNaN(n) && n === 0
+  }
+
+  // 输入框红/灰态（changed = 与 Odoo 原值不一致）
+  function drawFieldInput(inp, changed) {
+    if (!inp) return
+    inp.style.borderColor = changed ? "#fca5a5" : "#d1d5db"
+    inp.style.background = changed ? "#fff5f5" : "#fff"
+  }
+
+  // 价格输入框锁定（缺货行置 0 固定，防误改）/ 解锁
+  function applyPriceFrozen(inp, frozen) {
+    if (!inp) return
+    inp.readOnly = !!frozen
+    if (frozen) {
+      inp.style.background = "#fef2f2"
+      inp.style.color = "#b91c1c"
+      inp.style.borderColor = "#fca5a5"
+      inp.style.cursor = "not-allowed"
+      inp.title = "该行缺货（包装数量为 0）：单价 / 0.9箱规价固定置 0 写回"
+    } else {
+      inp.style.color = "#111827"
+      inp.style.cursor = ""
+      inp.title = ""
+    }
+  }
+
+  // Odoo 原值小字（删除线）增删/更新（0.9总价列的小字由 syncTotal09Compare 维护）
+  function syncFieldBadge(row, key) {
+    if (key === "total09") return
+    var f = findField(row.fields, key)
+    var rowEl = row._fieldRows && row._fieldRows[key]
+    if (!f || !rowEl) return
+    if (!row._badges) row._badges = {}
+    var need = !!(f.changed && !row.error && f.oldValue !== null && f.oldValue !== undefined && f.oldValue !== "")
+    var b = row._badges[key]
+    if (need) {
+      if (!b) {
+        b = el("span", { style: "font-size:10px;color:#9ca3af;text-decoration:line-through" }, "")
+        row._badges[key] = b
+        rowEl.appendChild(b)
+      }
+      b.textContent = "Odoo 原值: " + fmtNum(f.oldValue)
+    } else if (b) {
+      b.remove()
+      row._badges[key] = null
+    }
+  }
+
+  // 备注字段切换：on=true → 备注「缺货」（无备注字段则动态补输入框）；on=false → 移除动态字段 / 还原原备注
+  function setRowRemarkOutstock(row, on) {
+    var rf = findField(row.fields, "remark")
+    if (on) {
+      if (!rf) {
+        rf = {
+          key: "remark", label: "备注", odooField: ODOO_FIELDS.remark,
+          oldValue: "", newValue: "缺货", changed: true, reason: REASONS.boxQtyEmpty
+        }
+        row.fields.push(rf)
+        row._osRemarkDynamic = true
+        mountFieldInput(row, "remark", rf)
+      } else {
+        rf.newValue = "缺货"
+        rf.changed = true
+        rf.reason = REASONS.boxQtyEmpty
+      }
+      var inp = row._inputs && row._inputs.remark
+      if (inp) { inp.value = "缺货"; drawFieldInput(inp, true) }
+      syncFieldBadge(row, "remark")
+      return
+    }
+    if (!rf) return
+    // 动态补挂的备注（该行原本没有备注字段）→ 整体移除，不写回任何备注
+    if (row._osRemarkDynamic) {
+      var idx = row.fields.indexOf(rf)
+      if (idx >= 0) row.fields.splice(idx, 1)
+      if (row._inputs) delete row._inputs.remark
+      if (row._fieldRows) delete row._fieldRows.remark
+      if (row._badges) delete row._badges.remark
+      var oldTd = row._fieldTds && row._fieldTds.remark
+      if (oldTd) {
+        var blank = document.createElement("td")
+        blank.style.cssText = "padding:4px 6px;text-align:center;vertical-align:middle"
+        blank.innerHTML = '<span style="color:#d1d5db">—</span>'
+        if (oldTd.parentNode) oldTd.parentNode.replaceChild(blank, oldTd)
+        row._fieldTds.remark = blank
+      }
+      row._osRemarkDynamic = false
+      return
+    }
+    // 源数据即缺货的行（备注字段静态存在）：改回非 0 → 备注回退为原值（不再写「缺货」）
+    rf.newValue = rf.oldValue || ""
+    rf.changed = false
+    rf.reason = null
+    var inp2 = row._inputs && row._inputs.remark
+    if (inp2) { inp2.value = String(rf.newValue); drawFieldInput(inp2, false) }
+    syncFieldBadge(row, "remark")
+  }
+
+  // 单件入口缺货需写 box_wholesale_price=0（整箱批发价列已隐藏，此处仅补字段供写回）
+  function setRowBoxWholesaleZero(row, on) {
+    var f = findField(row.fields, "boxWholesale")
+    if (on) {
+      if (!f) {
+        row.fields.push({
+          key: "boxWholesale", label: "整箱批发价", odooField: ODOO_FIELDS.boxWholesalePrice,
+          oldValue: null, newValue: 0, changed: true, pdfSource: "缺货置 0", reason: REASONS.outstockZero
+        })
+      } else {
+        f.newValue = 0
+        f.changed = true
+        f.pdfSource = "缺货置 0"
+        f.reason = REASONS.outstockZero
+      }
+      return
+    }
+    // 还原：已不再缺货 → 移除「缺货置 0」产生的整箱批发价字段（单件入口正常不写此字段）
+    if (f && f.pdfSource === "缺货置 0") row.fields.splice(row.fields.indexOf(f), 1)
+  }
+
+  // 核心：包装数量 → 0/空 时切换该行缺货状态（价格置 0 + 备注 + 标红 + 勾选 + 数量核对列刷新）
+  function syncRowOutstock(row) {
+    if (!row || row.error || !row._inputs) return
+    if (row.kind === "outstock") return                 // 源数据缺货：静态逻辑已处理
+    var on = isRowOutstock(row)
+    if (on === !!row._manualOutstock) return            // 状态未变，无需处理
+    row._manualOutstock = on
+    var priceKeys = findField(row.fields, "boxPrice09") ? ["unitPrice", "boxPrice09"] : ["unitPrice"]
+    if (on) {
+      // 快照：进入缺货前的可编辑价格值（改回非 0 时还原）
+      // 已是「缺货置 0」状态的字段不快照（其自然值在 calcValue 里），备注不快照（还原逻辑单独处理）
+      if (!row._osSnapshot) {
+        var snap = { values: {}, flags: {}, checked: !!row.checked }
+        for (var i = 0; i < priceKeys.length; i++) {
+          var sf = findField(row.fields, priceKeys[i])
+          if (!sf || sf.pdfSource === "缺货置 0") continue
+          snap.values[priceKeys[i]] = row._inputs[priceKeys[i]] ? row._inputs[priceKeys[i]].value : null
+          snap.flags[priceKeys[i]] = { newValue: sf.newValue, changed: sf.changed, reason: sf.reason, pdfSource: sf.pdfSource, oldValue: sf.oldValue }
+        }
+        row._osSnapshot = snap
+      }
+      // 价格置 0 + 锁定
+      for (var p = 0; p < priceKeys.length; p++) {
+        var pk = priceKeys[p]
+        var pf = findField(row.fields, pk)
+        if (!pf) continue
+        if (pf.calcValue === undefined) pf.calcValue = pf.newValue
+        pf.newValue = 0
+        pf.changed = true
+        pf.reason = REASONS.outstockZero
+        pf.pdfSource = "缺货置 0"
+        var pin = row._inputs[pk]
+        if (pin) { pin.value = "0"; applyPriceFrozen(pin, true) }
+        syncFieldBadge(row, pk)
+      }
+      // 单件入口：补整箱批发价置 0（套装由 boxPrice09 覆盖，无需补）
+      if (!findField(row.fields, "boxPrice09")) setRowBoxWholesaleZero(row, true)
+      setRowRemarkOutstock(row, true)
+      row.checked = true
+      if (row._cb) row._cb.checked = true
+      if (row._tr) { row._tr.style.background = "#fef2f2"; row._tr.style.borderBottomColor = "#fca5a5" }
+    } else {
+      var snap2 = row._osSnapshot
+      for (var r = 0; r < priceKeys.length; r++) {
+        var rk = priceKeys[r]
+        var rf = findField(row.fields, rk)
+        if (!rf) continue
+        var sv = snap2 && snap2.values ? snap2.values[rk] : null
+        var hasSnap = !!(snap2 && snap2.values && Object.prototype.hasOwnProperty.call(snap2.values, rk) && sv !== null && sv !== undefined && sv !== "")
+        var rv = hasSnap ? sv : ((rf.calcValue === null || rf.calcValue === undefined) ? "" : String(rf.calcValue))
+        var rfFlag = hasSnap && snap2.flags ? snap2.flags[rk] : null
+        var rin = row._inputs[rk]
+        if (rin) { rin.value = rv; applyPriceFrozen(rin, false) }
+        rf.newValue = rv === "" ? null : parseFloat(rv)
+        rf.changed = !!rfFlag && !!rfFlag.changed
+        rf.reason = rfFlag ? rfFlag.reason : null
+        rf.pdfSource = rfFlag ? rfFlag.pdfSource : ""
+        // 按 Odoo 原值重新判定不一致（价格列红框口径）
+        if (rf.oldValue !== null && rf.oldValue !== undefined && rf.oldValue !== "") {
+          rf.changed = !numEq(rf.oldValue, rf.newValue)
+          if (!rf.changed) rf.reason = null
+        }
+        drawFieldInput(rin, rf.changed && !row.error)
+        syncFieldBadge(row, rk)
+      }
+      setRowBoxWholesaleZero(row, false)
+      setRowRemarkOutstock(row, false)
+      row.checked = snap2 ? snap2.checked : row.checked
+      if (row._cb) row._cb.checked = row.checked
+      if (row._tr) { row._tr.style.background = row._bg; row._tr.style.borderBottomColor = row._border }
+    }
+    paintQtyCell(row)
+    recalcRowTotal(row)
+    refreshTotal()
+  }
+
   // source: 'pdf' | 'excel'（2026-08-18 双流共用：Excel 流无 PDF 比对，标题/字段列布局按 source 区分）
   function buildPdfPreviewModal(previewRows, fileName, source) {
     removeModals()
@@ -2479,7 +2981,7 @@
     overlay.appendChild(modal)
 
     // Header
-    var h2Title = el("h2", { style: "margin:0;font-size:16px;color:#111827;flex:1;min-width:0" }, titleIcon + " " + (fileName || (source === "excel" ? "Excel 导入预览" : "PDF 修正预览")))
+    var h2Title = el("h2", { style: "margin:0;font-size:16px;color:#111827;flex:1;min-width:0" }, titleIcon + " " + (fileName || "供应商数据导入预览"))
     if (refList.length > 0) {
       h2Title.appendChild(el("span", { style: "color:#7c3aed;font-size:13px;margin-left:10px;font-weight:600;word-break:break-all" }, refList.join(" | ")))
     }
@@ -2493,14 +2995,11 @@
       }, "✕")
     ]))
 
-    // 统计栏
-    var actionable = previewRows.filter(function (r) { return r.hasAction && !r.error }).length
-    var errors = previewRows.filter(function (r) { return r.error }).length
-    var outstock = previewRows.filter(function (r) { return r.kind === "outstock" }).length
-    var qtyMis = previewRows.filter(function (r) { return r.qtyMismatch }).length
-    modal.appendChild(el("div", {
-      style: "padding:10px 20px;background:#f0f9ff;font-size:12px;color:#1e40af"
-    }, "共 " + previewRows.length + " 行  ·  " + actionable + " 行可写入" + (qtyMis > 0 ? "  ·  " + qtyMis + " 行数量不一致" : "") + (outstock > 0 ? "  ·  " + outstock + " 行缺货" : "") + (errors > 0 ? "  ·  " + errors + " 行匹配失败" : "") + "  · 不一致字段可编辑，悬浮可查看原因，底部为各列总和"))
+    // 统计栏（v3.9：文案由 paintPdfStats 统一生成，包装数量改动后实时刷新）
+    var statsEl = el("div", { style: "padding:10px 20px;background:#f0f9ff;font-size:12px;color:#1e40af" }, "")
+    pdfStatsEl = statsEl
+    modal.appendChild(statsEl)
+    paintPdfStats(previewRows)
 
     // 表格
     var tableWrap = el("div", { style: "flex:1;overflow:auto;max-height:60vh" })
@@ -2646,14 +3145,146 @@
     return tr
   }
 
+  // 数量核对列内容（v3.9：抽出以便包装数量改 0 → 缺货时原地刷新）
+  function paintQtyCell(row) {
+    var tdEl = row && row._qtyTd
+    if (!tdEl) return
+    if (isRowOutstock(row)) {
+      tdEl.innerHTML = '<span style="color:#dc2626;font-weight:600;text-decoration:underline dotted;cursor:help">缺货</span>'
+    } else if (row.qtyMismatch || (row.qtyDetail && row.qtyDetail.length > 1)) {
+      var isMis = row.qtyMismatch
+      tdEl.innerHTML = isMis
+        ? '<span style="color:#dc2626;font-weight:600;text-decoration:underline dotted;cursor:help">' + fmtNum(row.qtySum) + ' ≠ ' + fmtNum(row.qtyTarget) + '</span>'
+        : '<span style="color:#16a34a;font-weight:600;text-decoration:underline dotted;cursor:help">✓ ' + fmtNum(row.qtyTarget) + '</span>'
+    } else {
+      tdEl.innerHTML = '<span style="color:#16a34a;font-weight:600">✓ ' + fmtNum(row.qtyTarget) + '</span>'
+    }
+  }
+
+  // 数量核对列悬浮提示（按 hover 时刻状态生成：缺货 / 不一致明细 / 一致则不出气泡）
+  function qtyCellTipHtml(row) {
+    if (isRowOutstock(row)) {
+      return escHtml(row.kind === "outstock" ? REASONS.outstock : REASONS.boxQtyEmpty)
+    }
+    var dd = row.qtyDetail || []
+    var isMis = row.qtyMismatch
+    if (!isMis && dd.length <= 1) return ""
+    var html = '<div style="font-weight:600;margin-bottom:4px;color:#e5e7eb">供应商 Qty = ' + escHtml(fmtNum(row.qtyTarget)) + '</div>'
+    if (dd.length > 1) {
+      html += '<div style="margin-bottom:2px">数量由以下订单关联相加：</div>'
+      for (var di = 0; di < dd.length; di++) {
+        html += '<div>· ' + escHtml(dd[di].ref || "—") + '（SKU ' + escHtml(dd[di].sku || "—") + '）：' + fmtNum(dd[di].qty) + ' 件</div>'
+      }
+    }
+    html += '<div>' + escHtml(isMis ? REASONS.qtySum(row.qtySum, row.qtyTarget) : ("合计 " + fmtNum(row.qtySum) + " = 供应商 Qty " + fmtNum(row.qtyTarget))) + '</div>'
+    return html
+  }
+
+  // 单个字段单元格（输入框 + Odoo 原值小字 + 不一致原因悬浮 + 编辑实时刷新）
+  // v3.9：从 renderPdfPreviewRow 抽出，便于「包装数量改 0 → 缺货」时动态补挂「备注」输入框
+  function buildFieldCell(row, key, f, changed, colMaxLen) {
+    var ftd = document.createElement("td")
+    ftd.style.cssText = "padding:4px 6px;text-align:center;vertical-align:middle"
+    if (!row._fieldTds) row._fieldTds = {}
+    if (!row._fieldRows) row._fieldRows = {}
+    if (!row._badges) row._badges = {}
+    if (!row._inputs) row._inputs = {}
+    row._fieldTds[key] = ftd
+    if (!f) {
+      ftd.innerHTML = '<span style="color:#d1d5db">—</span>'
+      return ftd
+    }
+    changed = !!changed && !row.error
+    var input = document.createElement("input")
+    input.type = "text"
+    // v3.6.1（2026-09-04）：初值一律展示计算值 newValue——Odoo 匹配不上的行（oldValue 无回填、无法比对原值）
+    // 也能看到计算出的价格/0.9总价；无计算值再退回 fieldDisplayVal（Odoo 原值或空）
+    input.value = fieldInitValue(f)
+    // 宽度：该列所有行计算值中最多位数者为基底，全列统一；+1ch+14px 余量保证数字完整显示
+    var w = (colMaxLen && colMaxLen[key]) || 7
+    input.style.cssText = "width:calc(" + (w + 1) + "ch + 14px);padding:5px 6px;border:1px solid " + (changed ? "#fca5a5" : "#d1d5db") +
+      ";border-radius:6px;font-size:12px;color:#111827;background:" + (changed ? "#fff5f5" : "#fff") +
+      ";box-sizing:border-box;text-align:center"
+    // v3.6：0.9总价 动态计算列——readonly 展示 = 价格 × 包装数量，改数量/价格时自动重算（recalcRowTotal）
+    // v3.7.2：背景/边框的红灰态由 syncTotal09Compare 动态维护（初始 + 实时比对 Odoo price_subtotal），此处仅置只读灰
+    if (key === "total09") {
+      input.readOnly = true
+      input.style.background = "#f3f4f6"
+      input.style.color = "#4b5563"
+      input.style.cursor = "not-allowed"
+      input.title = "0.9总价（动态）= " + (findField(row.fields, "boxPrice09") ? "0.9箱规价 × 包装数量" : "单价 × 包装数量") + "，只读不写回"
+    }
+    // 输入框与 Odoo 原值平级（同一行居中，2026-08-18：去掉 PDF 来源小字；v3.0：原值改 Odoo 值）
+    var fieldRow = el("div", { style: "display:flex;align-items:center;justify-content:center;gap:8px;white-space:nowrap" })
+    fieldRow.appendChild(input)
+    // v3.7.2：0.9总价 的「Odoo 原值」小字与红框由 syncTotal09Compare 动态增删（实时比对），不走静态创建
+    if (key === "total09") {
+      row._total09Box = { input: input, rowEl: fieldRow, badge: null, titleDef: input.title }
+    } else if (changed && f.oldValue !== null && f.oldValue !== undefined && f.oldValue !== "") {
+      var badge = el("span", { style: "font-size:10px;color:#9ca3af;text-decoration:line-through" }, "Odoo 原值: " + fmtNum(f.oldValue))
+      row._badges[key] = badge
+      fieldRow.appendChild(badge)
+    }
+    ftd.appendChild(fieldRow)
+    row._inputs[key] = input
+    // v3.9.1：此处必须保留分号——下一行是 `(function ...)()`，缺分号会被 ASI 误解析为 fieldRow(...) 调用
+    row._fieldRows[key] = fieldRow;
+    // 不一致原因悬浮气泡 + 编辑实时刷新总和（IIFE 捕获 input/f，避免闭包共享）
+    (function (inp, fld) {
+      if (fld.reason && changed) {
+        var tip = null
+        inp.addEventListener("mouseenter", function () {
+          if (tip || !fld.reason) return
+          tip = el("div", {
+            style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:8px 10px;border-radius:6px;max-width:440px;line-height:1.5;pointer-events:none"
+          })
+          // 两行悬浮：第一行 PDF 原始字段与数据，第二行计算过程（2026-08-18 用户需求）
+          tip.innerHTML = fld.pdfRaw
+            ? '<div style="font-weight:600;margin-bottom:4px;color:#e5e7eb;white-space:pre-wrap">' + escHtml(fld.pdfRaw) + '</div>' +
+              '<div style="white-space:pre-wrap">' + escHtml(fld.reason) + '</div>'
+            : escHtml(fld.reason)
+          document.body.appendChild(tip)
+          var r = inp.getBoundingClientRect()
+          tip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - tip.offsetWidth - 8)) + "px"
+          tip.style.top = Math.max(8, r.top - tip.offsetHeight - 8) + "px"
+        })
+        inp.addEventListener("mouseleave", function () {
+          if (tip) { tip.remove(); tip = null }
+        })
+      }
+      // v3.6：改价格/数量 → 先重算本行 0.9总价（动态列），再刷新全表总和与组小计
+      // v3.9：改包装数量 → 0/空时先切缺货态（备注 + 价格置 0），再重算
+      inp.addEventListener("input", function () {
+        if (key === "boxQty") syncRowOutstock(row)
+        recalcRowTotal(row)
+        refreshTotal()
+      })
+    })(input, f)
+    return ftd
+  }
+
+  // 动态补挂字段单元格（用于缺货时给原本无「备注」字段的行加输入框）
+  function mountFieldInput(row, key, f) {
+    if (!row._fieldTds || !row._fieldTds[key]) return
+    var oldTd = row._fieldTds[key]
+    var newTd = buildFieldCell(row, key, f, f.changed, row._colMaxLen)
+    if (oldTd.parentNode) oldTd.parentNode.replaceChild(newTd, oldTd)
+  }
+
   function renderPdfPreviewRow(row, order, colMaxLen, rowIndex, source) {
     var tr = document.createElement("tr")
     var isExcel = source === "excel"
-    var alertRow = row.error || row.qtyMismatch || row.kind === "outstock"
+    // v3.9：包装数量为 0/空 的行同样按缺货标红（静态 + modal 动态一致）
+    var alertRow = row.error || row.qtyMismatch || isRowOutstock(row)
     // 交替行色美化；警示行红底优先
     var bg = alertRow ? "#fef2f2" : ((rowIndex || 0) % 2 === 0 ? "#ffffff" : "#f9fafb")
     var border = alertRow ? "#fca5a5" : "#e5e7eb"
     tr.style.cssText = "border-bottom:1px solid " + border + ";background:" + bg
+    // v3.9：记录行元素与底色，供 modal 内切换缺货态时变更/还原
+    row._tr = tr
+    row._bg = bg
+    row._border = border
+    row._cb = null
 
     // 勾选框
     var tdCb = document.createElement("td")
@@ -2664,6 +3295,7 @@
       cb.checked = row.checked; cb.style.cursor = "pointer"
       cb.addEventListener("change", function () { row.checked = cb.checked })
       tdCb.appendChild(cb)
+      row._cb = cb
     } else {
       tdCb.innerHTML = '<span style="color:#d1d5db">—</span>'
     }
@@ -2712,57 +3344,28 @@
     // 数量核对 + PDF Qty 两列（仅 PDF 流；Excel 流无 PDF 源，2026-08-18）
     if (!isExcel) {
       // 数量核对：PDF Qty vs 包装数量（多条求和）；一致 ✓ 绿色，不一致红色 + hover 原因
+      // v3.9：内容/气泡抽成 paintQtyCell + qtyCellTipHtml——包装数量被改成 0/空时原地切成「缺货」
       var qtyTd = document.createElement("td")
       qtyTd.style.cssText = "padding:6px 8px;font-size:11px;text-align:center;vertical-align:middle;white-space:nowrap"
-      if (row.kind === "outstock") {
-        qtyTd.innerHTML = '<span style="color:#dc2626;font-weight:600;text-decoration:underline dotted;cursor:help">缺货</span>'
-        var osTip = null
-        qtyTd.addEventListener("mouseenter", function () {
-          if (osTip) return
-          osTip = el("div", {
-            style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:6px 10px;border-radius:6px;max-width:340px;line-height:1.5;pointer-events:none"
-          }, REASONS.outstock)
-          document.body.appendChild(osTip)
-          var r = qtyTd.getBoundingClientRect()
-          osTip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - osTip.offsetWidth - 8)) + "px"
-          osTip.style.top = Math.max(8, r.top - osTip.offsetHeight - 8) + "px"
+      row._qtyTd = qtyTd
+      paintQtyCell(row)
+      var qTip = null
+      qtyTd.addEventListener("mouseenter", function () {
+        if (qTip) return
+        var qHtml = qtyCellTipHtml(row)
+        if (!qHtml) return
+        qTip = el("div", {
+          style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:8px 10px;border-radius:6px;max-width:340px;line-height:1.6;pointer-events:none"
         })
-        qtyTd.addEventListener("mouseleave", function () {
-          if (osTip) { osTip.remove(); osTip = null }
-        })
-      } else if (row.qtyMismatch || (row.qtyDetail && row.qtyDetail.length > 1)) {
-        // 数量不一致 或 同 SKU 多条订单关联相加 → 悬浮显示明细（2026-08-19 用户需求）
-        var isMis = row.qtyMismatch
-        qtyTd.innerHTML = isMis
-          ? '<span style="color:#dc2626;font-weight:600;text-decoration:underline dotted;cursor:help">' + fmtNum(row.qtySum) + ' ≠ ' + fmtNum(row.qtyTarget) + '</span>'
-          : '<span style="color:#16a34a;font-weight:600;text-decoration:underline dotted;cursor:help">✓ ' + fmtNum(row.qtyTarget) + '</span>'
-        var qTip = null
-        qtyTd.addEventListener("mouseenter", function () {
-          if (qTip) return
-          qTip = el("div", {
-            style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:8px 10px;border-radius:6px;max-width:340px;line-height:1.6;pointer-events:none"
-          })
-          var qhtml = '<div style="font-weight:600;margin-bottom:4px;color:#e5e7eb">供应商 Qty = ' + escHtml(fmtNum(row.qtyTarget)) + '</div>'
-          var dd = row.qtyDetail || []
-          if (dd.length > 1) {
-            qhtml += '<div style="margin-bottom:2px">数量由以下订单关联相加：</div>'
-            for (var di = 0; di < dd.length; di++) {
-              qhtml += '<div>· ' + escHtml(dd[di].ref || "—") + '（SKU ' + escHtml(dd[di].sku || "—") + '）：' + fmtNum(dd[di].qty) + ' 件</div>'
-            }
-          }
-          qhtml += '<div>' + escHtml(isMis ? REASONS.qtySum(row.qtySum, row.qtyTarget) : ("合计 " + fmtNum(row.qtySum) + " = 供应商 Qty " + fmtNum(row.qtyTarget))) + '</div>'
-          qTip.innerHTML = qhtml
-          document.body.appendChild(qTip)
-          var r = qtyTd.getBoundingClientRect()
-          qTip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - qTip.offsetWidth - 8)) + "px"
-          qTip.style.top = Math.max(8, r.top - qTip.offsetHeight - 8) + "px"
-        })
-        qtyTd.addEventListener("mouseleave", function () {
-          if (qTip) { qTip.remove(); qTip = null }
-        })
-      } else {
-        qtyTd.innerHTML = '<span style="color:#16a34a;font-weight:600">✓ ' + fmtNum(row.qtyTarget) + '</span>'
-      }
+        qTip.innerHTML = qHtml
+        document.body.appendChild(qTip)
+        var r = qtyTd.getBoundingClientRect()
+        qTip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - qTip.offsetWidth - 8)) + "px"
+        qTip.style.top = Math.max(8, r.top - qTip.offsetHeight - 8) + "px"
+      })
+      qtyTd.addEventListener("mouseleave", function () {
+        if (qTip) { qTip.remove(); qTip = null }
+      })
       tr.appendChild(qtyTd)
 
       // PDF Qty 列：PDF 原始 qty 值（= qtyTarget，outstock 无值显示 —，2026-08-18 新增）
@@ -2772,76 +3375,17 @@
       tr.appendChild(pdfQtyTd)
     }
 
-    // 字段输入框 + PDF 来源对照小字 + 不一致原因悬浮（2026-08-18 增强）
+    // 字段输入框 + Odoo 原值小字 + 不一致原因悬浮（2026-08-18 增强）
+    // v3.9：单格渲染抽成 buildFieldCell（缺货时需动态补挂「备注」输入框）
     row._inputs = {}
+    row._colMaxLen = colMaxLen
     for (var oi = 0; oi < order.length; oi++) {
       var key = order[oi]
       var f = findField(row.fields, key)
-      var ftd = document.createElement("td")
-      ftd.style.cssText = "padding:4px 6px;text-align:center;vertical-align:middle"
-      if (!f) {
-        ftd.innerHTML = '<span style="color:#d1d5db">—</span>'
-      } else {
-        var changed = f.changed && !row.error
-        var input = document.createElement("input")
-        input.type = "text"
-        // v3.6.1（2026-09-04）：初值一律展示计算值 newValue——Odoo 匹配不上的行（oldValue 无回填、无法比对原值）
-        // 也能看到计算出的价格/0.9总价；无计算值再退回 fieldDisplayVal（Odoo 原值或空）
-        input.value = fieldInitValue(f)
-        // 宽度：该列所有行计算值中最多位数者为基底，全列统一；+1ch+14px 余量保证数字完整显示
-        var w = (colMaxLen && colMaxLen[key]) || 7
-        input.style.cssText = "width:calc(" + (w + 1) + "ch + 14px);padding:5px 6px;border:1px solid " + (changed ? "#fca5a5" : "#d1d5db") +
-          ";border-radius:6px;font-size:12px;color:#111827;background:" + (changed ? "#fff5f5" : "#fff") +
-          ";box-sizing:border-box;text-align:center"
-        // v3.6：0.9总价 动态计算列——readonly 展示 = 价格 × 包装数量，改数量/价格时自动重算（recalcRowTotal）
-        // v3.7.2：背景/边框的红灰态由 syncTotal09Compare 动态维护（初始 + 实时比对 Odoo price_subtotal），此处仅置只读灰
-        if (key === "total09") {
-          input.readOnly = true
-          input.style.background = "#f3f4f6"
-          input.style.color = "#4b5563"
-          input.style.cursor = "not-allowed"
-          input.title = "0.9总价（动态）= " + (findField(row.fields, "boxPrice09") ? "0.9箱规价 × 包装数量" : "单价 × 包装数量") + "，只读不写回"
-        }
-        // 输入框与 Odoo 原值平级（同一行居中，2026-08-18：去掉 PDF 来源小字；v3.0：原值改 Odoo 值）
-        var fieldRow = el("div", { style: "display:flex;align-items:center;justify-content:center;gap:8px;white-space:nowrap" })
-        fieldRow.appendChild(input)
-        // v3.7.2：0.9总价 的「Odoo 原值」小字与红框由 syncTotal09Compare 动态增删（实时比对），不走静态创建
-        if (key === "total09") {
-          row._total09Box = { input: input, rowEl: fieldRow, badge: null, titleDef: input.title }
-        } else if (changed && f.oldValue !== null && f.oldValue !== undefined && f.oldValue !== "") {
-          fieldRow.appendChild(el("span", { style: "font-size:10px;color:#9ca3af;text-decoration:line-through" }, "Odoo 原值: " + fmtNum(f.oldValue)))
-        }
-        ftd.appendChild(fieldRow)
-        row._inputs[key] = input;
-        // 不一致原因悬浮气泡 + 编辑实时刷新总和（IIFE 捕获 input/f，避免闭包共享）
-        (function (inp, fld) {
-          if (fld.reason && changed) {
-            var tip = null
-            inp.addEventListener("mouseenter", function () {
-              if (tip || !fld.reason) return
-              tip = el("div", {
-                style: "position:fixed;z-index:100050;background:#1f2937;color:#f9fafb;font-size:11px;padding:8px 10px;border-radius:6px;max-width:440px;line-height:1.5;pointer-events:none"
-              })
-              // 两行悬浮：第一行 PDF 原始字段与数据，第二行计算过程（2026-08-18 用户需求）
-              tip.innerHTML = fld.pdfRaw
-                ? '<div style="font-weight:600;margin-bottom:4px;color:#e5e7eb;white-space:pre-wrap">' + escHtml(fld.pdfRaw) + '</div>' +
-                  '<div style="white-space:pre-wrap">' + escHtml(fld.reason) + '</div>'
-                : escHtml(fld.reason)
-              document.body.appendChild(tip)
-              var r = inp.getBoundingClientRect()
-              tip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - tip.offsetWidth - 8)) + "px"
-              tip.style.top = Math.max(8, r.top - tip.offsetHeight - 8) + "px"
-            })
-            inp.addEventListener("mouseleave", function () {
-              if (tip) { tip.remove(); tip = null }
-            })
-          }
-          // v3.6：改价格/数量 → 先重算本行 0.9总价（动态列），再刷新全表总和与组小计
-          inp.addEventListener("input", function () { recalcRowTotal(row); refreshTotal() })
-        })(input, f)
-      }
-      tr.appendChild(ftd)
+      tr.appendChild(buildFieldCell(row, key, f, f && f.changed, colMaxLen))
     }
+    // 缺货态初始化（v3.9：源数据包装数量为 0 的匹配行也按缺货展示；后续改动由 syncRowOutstock 接管）
+    row._manualOutstock = isRowOutstock(row)
     // v3.7.2：每行渲染完按初始值建立一次 0.9总价 比对态（红框 / Odoo 原值小字）
     if (row._total09Box) syncTotal09Compare(row)
     return tr
@@ -2850,6 +3394,26 @@
   // ── 列总和行（2026-08-18：所有数值列全表合计，随输入框编辑实时刷新）──
   var SUM_KEYS = { boxQty: 1, unitPrice: 1, boxPrice09: 1, total09: 1 }
   var pdfTotalCtx = null
+  var pdfStatsEl = null   // 统计栏元素（v3.9：modal 内包装数量改 0 触发缺货时实时刷新行数统计）
+
+  // 统计栏文案（v3.9：抽出，缺货/数量不一致行数随编辑实时刷新）
+  function paintPdfStats(previewRows) {
+    if (!pdfStatsEl || !previewRows) return
+    var actionable = 0, errors = 0, outstock = 0, qtyMis = 0
+    for (var i = 0; i < previewRows.length; i++) {
+      var r = previewRows[i]
+      var os = isRowOutstock(r)
+      if (r.hasAction && !r.error) actionable++
+      if (r.error) errors++
+      if (os) outstock++
+      else if (r.qtyMismatch) qtyMis++
+    }
+    pdfStatsEl.textContent = "共 " + previewRows.length + " 行  ·  " + actionable + " 行可写入" +
+      (qtyMis > 0 ? "  ·  " + qtyMis + " 行数量不一致" : "") +
+      (outstock > 0 ? "  ·  " + outstock + " 行缺货" : "") +
+      (errors > 0 ? "  ·  " + errors + " 行匹配失败" : "") +
+      "  · 不一致字段可编辑，悬浮可查看原因，底部为各列总和"
+  }
 
   // v3.6（2026-09-04 用户需求）：0.9总价 = 0.9箱规价(套装)/单价(单件) × 包装数量，随 modal 编辑实时重算
   // 同步 total09 输入框（只读列）与字段 newValue；价格/数量任一为空 → 留空（null）
@@ -2949,6 +3513,8 @@
         grp.cell.textContent = String(Math.round(gsum * 1000) / 1000)
       }
     }
+    // v3.9：顺带刷新统计栏（包装数量改 0 → 缺货行数随编辑变化）
+    paintPdfStats(ctx.rows)
   }
 
   function renderPdfTotalRow(previewRows, order, source, groupCtx) {
@@ -3026,6 +3592,16 @@
             changedDesc.push(f.label + "=" + n)
           }
         }
+      }
+      // v3.9（2026-09-10 用户需求）：modal 内把包装数量改成 0/空 → 该行按缺货写回
+      // （备注「缺货」+ 单价/整箱批发价置 0；包装数量字段存在时一并写 0）。此处按写入时刻的输入框值判定，防状态不同步
+      var rowOutstock = isRowOutstock(row)
+      if (rowOutstock) {
+        payload[ODOO_FIELDS.remark] = String(payload[ODOO_FIELDS.remark] || "").trim() || "缺货"
+        payload[ODOO_FIELDS.unitPrice] = 0
+        payload[ODOO_FIELDS.boxWholesalePrice] = 0
+        if (findField(row.fields, "boxQty")) payload[ODOO_FIELDS.boxQty] = 0
+        if (row.kind !== "outstock") changedDesc.push("缺货处理（包装数量为0）")
       }
       // v3.3：SKU 更新写回（UPC 匹配成功行的 single_sku / box_sku，独立于订单行写回）
       var skuUpd = (row.skuUpdate && row.skuUpdate.ok && row.skuUpdate.packagingId) ? row.skuUpdate : null

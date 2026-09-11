@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Odoo Excel Importer",
-  "version": "1.20.2",
-  "description": "Import Excel data into Odoo RFQ order lines & product master (name/brand)",
+  "version": "1.22.1",
+  "description": "Import supplier PDF/Excel data into Odoo RFQ order lines & product master (name/brand)",
   "icons": {
     "16": "icons/odoo-icon.png",
     "48": "icons/odoo-icon.png",
@@ -11,14 +11,14 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["lib/xlsx.full.min.js", "content.js"],
+      "js": ["lib/xlsx.full.min.js", "lib/pdf.min.js", "content.js"],
       "run_at": "document_idle"
     }
   ],
   "host_permissions": ["<all_urls>"],
   "web_accessible_resources": [
     {
-      "resources": ["lib/xlsx.full.min.js"],
+      "resources": ["lib/xlsx.full.min.js", "lib/pdf.worker.min.js"],
       "matches": ["<all_urls>"]
     }
   ]

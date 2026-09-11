@@ -1,7 +1,7 @@
 # Odoo Excel Importer — 项目文档
 
 > 本文件是项目的**权威文档**，与代码同步维护。任何 Agent 接任务前必须先读本文件。
-> 最后更新：2026-08-27（manifest v1.17.0，SKU 更新 v3.4：SKU 列按入口区分 单件=「订单行/包装/SKU」/套装=「订单行/包装/Box SKU」，单件不识别规格、套装保留 XX 比对）
+> 最后更新：2026-09-10（v3.9.1 / manifest v1.22.1：Modal 内把「包装数量」改成 0/空 → 按缺货写回；供应商数据上传支持原生多选；修复 buildFieldCell 缺分号被 ASI 解析成函数调用导致「预览失败」）
 
 ---
 
@@ -11,11 +11,11 @@
 |---|---|
 | 名称 | Odoo Excel Importer（`odoowritting-extension`） |
 | 类型 | Chrome 扩展（Manifest V3），content script 注入式工具 |
-| 业务目的 | 把采购 Excel / 供应商 PDF 数据批量写入 Odoo 采购订单（RFQ）明细行 |
-| 技术栈 | 纯原生 JS（**ES5 风格：`var` + IIFE + function 声明**），无框架、无构建步骤 |
-| 第三方库 | `lib/xlsx.full.min.js`（SheetJS）。~~`lib/pdf.min.js` + `lib/pdf.worker.min.js`（pdfjs-dist 3.11.174）~~ **v3.2 已移除**（PDF 修正入口删除，manifest 不再加载；lib 文件保留在仓库未删） |
+| 业务目的 | 把供应商数据（**PDF 或 PDF 转换版 Excel**，v3.8 自动识别）批量写入 Odoo 采购订单（RFQ）明细行 |
+| 技术栈 | 纯原生 JS（**ES5 风格：`var` + IIFE + function 声明**，无框架、无构建步骤） |
+| 第三方库 | `lib/xlsx.full.min.js`（SheetJS）。`lib/pdf.min.js` + `lib/pdf.worker.min.js`（pdfjs-dist 3.11.174 UMD，勿升 4.x）——**v3.2 曾移除加载，v3.8（2026-09-09）恢复**（manifest content_scripts 加载 pdf.min.js；pdf.worker.min.js 在 web_accessible_resources 供 worker 拉取） |
 | 运行环境 | Odoo 实例的 `purchase.order` 页面 **或** `product.product`（产品变体）页面（URL hash 含对应 `model=`） |
-| 版本 | manifest v1.17.0 |
+| 版本 | manifest v1.22.1 |
 
 **核心价值**：人工核对采购数据 → 自动写回 Odoo 的「数量 / 包装数量 / 整箱批发价 / 备注」字段，避免逐行手工录入。
 
@@ -25,12 +25,12 @@
 
 ```
 odoowritting_extension/
-├── content.js                 # ★ 主脚本（1866 行），全部业务逻辑与 UI
-├── manifest.json              # MV3 配置（v1.2.0）
+├── content.js                 # ★ 主脚本（约 3400 行），全部业务逻辑与 UI
+├── manifest.json              # MV3 配置（v1.22.1）
 ├── lib/
 │   ├── xlsx.full.min.js       # Excel 解析（SheetJS）
-│   ├── pdf.min.js             # （v3.2 起未使用，manifest 已移除加载；文件保留）
-│   └── pdf.worker.min.js      # （同上）
+│   ├── pdf.min.js             # PDF 解析（pdfjs-dist 3.11.174；v3.2 曾移除加载，v3.8 恢复）
+│   └── pdf.worker.min.js      # （同上，pdfjs worker，web_accessible_resources 提供）
 ├── odoowritting_extension/    # ⚠️ 打包副本（Chrome「加载已解压的扩展程序」用）
 │   ├── content.js             #    与根目录相同
 │   ├── manifest.json          #    旧版 v1.1.0
@@ -108,13 +108,13 @@ odoowritting_extension/
 | 常量 | 字段映射、列名、前缀 | — |
 | 工具 | DOM 创建 `el()`、HTML 转义 `escHtml()`、`sleep`、价格计算 | `calcBoxPrice`（×0.9，**v3.5 起精确到 2 位小数四舍五入**）、`parsePieces`（从 "1 box of 20 pieces" 取 20） |
 | Odoo API | JSON-RPC 封装 | `rpcCall`、`searchPoByRef`、`getOrderLines`（含 `product_packaging_qty`）、`updateOrderLine`；`searchPoByName` 已无用可删 |
-| Excel 解析 | 按表头列名解析 | `parseOrderExcel`（PDF/Excel 两流共用） |
-| PDF 解析 | 文本块坐标聚类成表 | `parsePdf`（pdfjs 入口）、`extractPdfTable`（核心算法） |
-| 业务逻辑 | 匹配修正规则 | `applyPdfByMode`（入口分发，PDF/Excel 两流共用）、`applyPdfSet`（套装）、`applyPdfSingle`（单件）、`parseConvertedPdfExcel`（Excel 流：PDF 转换版 Excel 解析，v1.7.0） |
+| Excel 解析 | 按表头列名解析 | `parseOrderExcel`（PDF/Excel 双来源共用） |
+| PDF 解析 | ⚠️ **v3.8（2026-09-09）恢复**：文本块坐标聚类成表 | `parsePdf`（pdfjs 入口，`pdfjsLib` 全局来自 lib/pdf.min.js）、`extractPdfTable`（核心算法）、`extractCoupon`（汇总区 Coupon） |
+| 业务逻辑 | 匹配修正规则 | `applyPdfByMode`（入口分发，单件/套装共用）、`applyPdfSet`（套装）、`applyPdfSingle`（单件）、`parseConvertedPdfExcel`（**Excel 分支**：供应商 Excel/PDF 转换版解析）、`detectSupplierKind`（**v3.8：按文件扩展名判 .pdf → PDF 分支 / .xlsx/.xls → Excel 分支**） |
 | 日志 | localStorage 存取 | `saveLog`/`getLog`/`clearLog`/`downloadLog` |
-| 状态 | 应用状态对象 | `appState`（含 `activeTab`）、`pdfState`、`excelState`、`dragCtx` |
-| UI | 按钮/卡片/三 Tab/上传区/日志区 | `createDraggableButton`、`renderCardContent`、**`renderTabSwitch`（三 Tab）**、`renderExcelZone`、`renderPdfZone`、**`renderProductZone`（商品库，v1.11.0）**、`renderModePicker`（两流共用） |
-| 预览 Modal | 双流共用 1 套 | `buildPdfPreviewModal(previewRows, fileName, source)`（source='pdf'/'excel'）、`loadOrderLineMap`、`buildPreviewRows` |
+| 状态 | 应用状态对象 | `appState`（含 `activeTab`：'excel'=供应商数据导入 / 'product'）、`excelState`（供应商导入区，`convFiles` 带 `kind`）、`productState`、`dragCtx` |
+| UI | 按钮/卡片/双 Tab/上传区/日志区 | `createDraggableButton`、`renderCardContent`、`renderTabSwitch`（🗂 供应商数据导入 / 🏷 商品库更新）、`renderExcelZone`（供应商数据导入区）、`renderProductZone`（商品库）、`renderModePicker`（单件/套装共用） |
+| 预览 Modal | 双流共用 1 套 | `buildPdfPreviewModal(previewRows, fileName, source)`（source 仅兼容签名）、`loadOrderLineMap`、`buildPreviewRows` |
 | 执行写回 | 双流共用批量写入 | `executePdfUpdate`（两流共用，字段经 ODOO_FIELDS 映射） |
 | 初始化 | 注入条件与路由 | `inject()`、`isPurchaseOrderPage()`、`hashchange` 监听 |
 
@@ -150,7 +150,7 @@ odoowritting_extension/
 >
 > 旧逻辑要点（重写时参考）：Excel 列 `row[0]`=UPC、`row[5]`=订单关联、`row[10]`=单价、`row[11]`=整箱批发价、`row[12]`=采购结果；写回 `price_unit`/`box_wholesale_price`/`remark`；备注按采购结果含「可能缺货/缺货」判定。
 
-### 6.2 修正匹配流（Excel 导入共用；manifest v1.5.0 起，v3.2 移除 PDF 修正入口）
+### 6.2 修正匹配流（供应商数据导入共用；manifest v1.5.0 起，v3.8 恢复 PDF 解析并归一为供应商数据导入）
 
 > ⚠️ **2026-08-18 规则再改**（覆盖 8-17 规则）：本次只改**套装**逻辑与 modal 展示，全局规则如下：
 >
@@ -192,7 +192,7 @@ odoowritting_extension/
 
 ```
 步骤0 选修正入口（单件📦 / 套装🎁）
-步骤1 上传 PDF → parsePdf → extractPdfTable（格式识别 + 跨页 + Coupon）
+步骤1 上传供应商数据（PDF → parsePdf → extractPdfTable；转换版 Excel → parseConvertedPdfExcel；v3.8 自动识别路由，可多个合并）
 步骤2 上传采购订单 Excel → parseOrderExcel（按列名）
 步骤3 匹配修正 applyPdfByMode → 预览 buildPdfPreviewModal（可编辑） → executePdfUpdate
 ```
@@ -254,39 +254,57 @@ odoowritting_extension/
 #### PDF 流写回（`executePdfUpdate`）
 
 - 写回字段：`product_packaging_qty`（包装数量）/ `box_wholesale_price`（0.9箱规价）/ `price_unit`（单价）/ `remark`（备注），经 ODOO_FIELDS 映射
-- 只处理勾选行；预览行标红场景：数量不一致（qtyMismatch）、缺货（outstock）、匹配失败（error）
+- 只处理勾选行；预览行标红场景：数量不一致（qtyMismatch）、缺货（outstock/包装数量为 0）、匹配失败（error）
 - 每条变更字段带 `odooField`，为 null 的字段（0.9总价）仅比对不写回
+- **v3.9 兜底**：写回时按输入框现值再判一次缺货（`isRowOutstock`），命中则强制 `remark=缺货`、`price_unit=0`、`box_wholesale_price=0`（原包装数量字段存在时一并写 0），避免 modal 状态未同步
 
-### 6.3 Excel 导入流（manifest v1.7.0 改造，2026-08-19）
+#### Modal 内「包装数量改为 0/空」→ 按缺货处理（v3.9，2026-09-10 用户需求）
 
-> **用户需求（2026-08-19）**：Excel 入口上传的是「**PDF 转换版 Excel**」（供应商订单确认 PDF 转成的 Excel，如 `Castlers Box 08.27_Order Confirmation_35548880.xlsx`），**比对逻辑与 PDF 流一模一样**：同样区分有无 HS CODE（格式 A/B）、同样提取 Coupon 决定 ×0.9、同样走单件/套装公式 → 预览修改 → 写回。用户确认：**仍需再传采购订单 Excel**（与 PDF 流一致的两步上传）。
+> 用户需求：预览 Modal 里**主动把某行「包装数量」改成 0**（或清空）时，该行也要走缺货逻辑（与源数据缺货一致）。
+
+- **触发**：`renderPdfPreviewRow` 给 boxQty 输入框挂 `input` 监听 → `syncRowOutstock(row)`（状态未变则直接返回）
+- **判定** `isRowOutstock(row)`：`kind==='outstock'`（Excel 有 PDF 无）**或** boxQty 值 = 空/0（取值优先用输入框实时值，渲染早期退回字段值）
+- **进入缺货态**：
+  - 价格字段（单价；套装另加 0.9箱规价）`newValue=0 / changed=true / reason=缺货置 0`，输入框置 "0" 并**锁定为只读**（红底，防误改）；进入前值快照到 `row._osSnapshot`，`calcValue` 保留计算值
+  - 单件入口动态补 `boxWholesale`（整箱批发价，`box_wholesale_price`）字段 = 0 写回（该列已隐藏，仅补字段）
+  - 备注：无 remark 字段的行**动态补挂输入框**（`mountFieldInput`），值「缺货」；行标红、复选框自动勾选
+  - 数量核对列原地刷成「缺货」（`paintQtyCell`）、悬浮气泡改为对应原因；统计栏行数实时刷新（`paintPdfStats`）
+- **改回非 0**：价格按快照（无快照用 `calcValue`）回滚 + 解锁 + 按 Odoo 原值重判红框/「Odoo 原值」小字；动态补挂的备注字段整体移除（不写回备注）、单件箱批发价字段移除；行色/勾选/数量核对列还原
+- **静态口径同步**：源数据即「包装数量为空/0」的匹配行，现在数量核对列同样显示「缺货」（此前显示「0 ≠ N」）、行标红、统计栏计入缺货行
+- 重构：`renderPdfPreviewRow` 的单格渲染抽成 `buildFieldCell`（渲染与动态补挂共用），数量核对列抽成 `paintQtyCell`/`qtyCellTipHtml`
+
+### 6.3 供应商数据导入流（v3.8 / manifest v1.21.0；前身 = v1.7.0「Excel 导入流」）
+
+> **v3.8（2026-09-09 用户需求）**：从 git 历史恢复 **PDF 解析**（v3.2 曾整体移除），并把上传界面统一为「**供应商数据导入**」——
+> **步骤1 上传供应商数据，脚本自动判别文件类型**：`.pdf` → 走 **PDF 分支**（pdfjs `parsePdf` → `extractPdfTable`）；`.xlsx/.xls` → 走 **Excel 分支**（`parseConvertedPdfExcel`，即「PDF 转换版 Excel」）。
+> 两分支输出同构 `{format, coupon, rows}`，**可混合多个文件统一合并**（合并/匹配/预览/写回零改动）。
 >
-> ⚠️ v1.6.0 的旧逻辑（上传采购订单 Excel → `applyExcelChanges` 比对 Odoo 现有值）**已移除**。
+> **历史（v1.7.0，2026-08-19）**：Excel 入口上传的是「PDF 转换版 Excel」（如 `Castlers Box 08.27_Order Confirmation_35548880.xlsx`），比对逻辑与 PDF 流一模一样。
+> ⚠️ v1.6.0 旧逻辑（上传采购订单 Excel → `applyExcelChanges` 比对 Odoo 现有值）**已移除**。
 
 ```
-步骤0 选入口（单件📦 / 套装🎁）——Excel 导入流用 renderModePicker
-步骤1 上传转换版 Excel（可多个，v1.12.0）→ 逐个 parseConvertedPdfExcel → 点「下一步」mergeConvFiles 合并
-步骤2 上传采购订单 Excel → parseOrderExcel → applyPdfByMode（与 PDF 流同一分发）
-步骤3 预览 buildPdfPreviewModal（pdf 布局）→ executePdfUpdate 写回
+步骤0 选入口（单件📦 / 套装🎁）——renderModePicker
+步骤1 上传供应商数据（PDF 或 Excel，可多个，v1.12.0 多文件）→ detectSupplierKind 自动识别：
+      .pdf → parsePdf（pdfjs，v3.8 恢复）｜.xlsx/.xls → parseConvertedPdfExcel → 点「下一步」mergeConvFiles 合并
+步骤2 上传采购订单 Excel → parseOrderExcel → applyPdfByMode（同一分发）
+步骤3 预览 buildPdfPreviewModal（数量核对/供应商 Qty 布局）→ executePdfUpdate 写回
 ```
 
-**多转换版文件（v1.12.0，2026-08-25 用户需求）**：
-- 上传区支持**反复添加**多个转换版 Excel：已添加文件列表（名称/行数/删除单个）+「继续添加」+「下一步」合并
-- `excelState` 改为 `convFiles[]`（每文件 {name, rows, format, coupon}）+ `convRows`（合并产物，点「下一步」生成）
-- **合并规则**（`mergeConvFiles`，用户确认）：同 UPC+包装去重（key 与拆分匹配键一致 = `UPC+description的(xN)`，提取不到 = 原 UPC）；合并行 **Qty 相加、Subtotal 相加**（价格×箱数与 0.9总价比对一致），UNIT PRICE/catalog/description 取第一个
-- **Coupon**（`mergeCoupon`，用户确认）：任一文件非 0 → 取该值（触发 ×0.9）；全 0 → 0
+**多供应商数据文件（v1.12.0，2026-08-25；v3.8 扩展支持 PDF/Excel 混合；v3.9 支持原生多选）**：
+- 上传区支持**反复添加**多个文件：已添加文件列表（类型图标/名称/行数/删除单个）+「继续添加」+「下一步」合并
+- **原生多选（v3.9）**：`makeDropZone(..., multi=true)` → 文件选择框带 `multiple`、拖拽取 `dataTransfer.files` 全部文件；逐个**类型校验**（不支持的文件汇总提示并跳过）后**串行**解析（`onFile` 返回 Promise 则等上一个完成，避免多个 PDF 同时解析卡住页面）。采购订单 Excel / 商品库两个上传区仍为单选（多余文件提示后取第一个）
+- `excelState.convFiles[]` 每文件 `{name, kind, rows, format, coupon}`（**kind = 'pdf' | 'excel'**，v3.8 新增）
+- **合并规则**（`mergeConvFiles`，用户确认）：同 UPC+包装去重（key 与拆分匹配键一致 = `UPC+description的(xN)`，提取不到 = 原 UPC）；合并行 **Qty 相加、Subtotal 相加**，UNIT PRICE/catalog/description 取第一个
+- **Coupon**（`mergeCoupon`）：任一文件非 0 → 取该值（触发 ×0.9）；全 0 → 0
 - 回步骤①保留已添加列表可编辑；「重置」全清；单文件解析失败仅提示不影响已添加文件
 - 合并后 rows 直接喂 `applyPdfByMode`，匹配/预览/写回/数量核对零改动
 
-**`parseConvertedPdfExcel(data)`（新增，content.js）**：
-- 表头行 = 首个含 `UPC|EAN` 关键字的行（转换版 Excel 前面有公司/客户信息行）
-- 格式识别：表头含 `HS CODE` → 格式 B，否则 A（与 PDF 流一致）
-- 列定位：按表头名正则（UPC/EAN、Catalog、Qty、Unit Price、Subtotal、Product Description），**容忍空列与用户附加列**（样本中 UNIT PRICE 与 QTY 之间有空列、SUBTOTAL 后用户加了 ×0.9 列，均不影响）
-- 数据行：UPC 列为 8~14 位纯数字的行；重复表头行跳过；汇总区（Line Total/Coupon/Total Amount）自然跳过
-- Coupon：含「Coupon」单元格所在行右侧首个数值（样本 = -73702.326 → factor 0.9）；无 Coupon 行 → 0（factor 1）
-- 返回 `{ format, coupon, rows:[{upc,catalog,qty,unitPrice,subtotal,description}] }` —— 与 `extractPdfTable` 输出同构，直接喂给 `applyPdfByMode`
+**解析双分支（输出同构）**：
+- **PDF 分支（v3.8 恢复）**：`parsePdf(arrayBuffer)`（pdfjs 拉取文本块，跨页 y 偏移）→ `extractPdfTable(items)`（表头定位/格式识别/行列聚类/列边界校准）→ `extractCoupon(items)`。**依赖**：manifest content_scripts 加载 `lib/pdf.min.js`（全局 `pdfjsLib`），`lib/pdf.worker.min.js` 列入 web_accessible_resources（workerSrc=chrome.runtime.getURL）
+- **Excel 分支**：`parseConvertedPdfExcel(data)`——表头行 = 首个含 `UPC|EAN` 关键字的行；格式识别：表头含 `HS CODE` → B，否则 A；列定位按表头名正则（UPC/EAN、Catalog、Qty/QTY/Quantity/QTYs、Unit Price、Subtotal、Product Description），容忍空列与用户附加列；数据行 = UPC 列为 8~14 位纯数字的行；Coupon 从含「Coupon」行右侧首个数值提取
+- 返回 `{ format, coupon, rows:[{upc,catalog,qty,unitPrice,subtotal,description}] }` —— 两分支同构，直接喂 `applyPdfByMode`
 
-**写回字段 / 比对规则 / 缺货规则 / Modal 交互**：与修正流（§6.2）完全一致，不再单独维护。**例外（v1.8.0，v1.12.4 已统一）**：Excel 流缺货行（备注「缺货」）的单价/整箱批发价置 0 写回，详见 §6.2 ⚠️ 块。Modal 的 `mode` 改为优先取预览行自带标记（`previewRows[0].mode`），`fieldOrder` 的 excel 分支已移除。
+**写回字段 / 比对规则 / 缺货规则 / Modal 交互**：与修正流（§6.2）完全一致，不再单独维护。**缺货行**（备注「缺货」）单价/整箱批发价置 0 写回（v1.12.4 起两入口统一），详见 §6.2 ⚠️ 块。Modal 的 `mode` 优先取预览行自带标记（`previewRows[0].mode`），兜底 `excelState.mode`。
 
 **样本实测（2026-08-19，node 单测）**：`Castlers Box 08.27_Order Confirmation_35548880.xlsx` → 格式 B、Coupon=-73702.326、64 行、UPC 全部合法、description 含 xN（套装单件数量）、Subtotal=UnitPrice×Qty 验算通过。
 
@@ -328,11 +346,11 @@ odoowritting_extension/
 |---|---|
 | 可拖动按钮 📥 | 右下角 52px 圆形紫色按钮，位置存 localStorage；拖文件到按钮上提示在卡片内选择入口 |
 | 悬浮卡片 | 点按钮展开（340×500px），含 Header、双 Tab、上传区、日志区 |
-| 双 Tab | 「📊 Excel 导入」/「🏷 商品库更新」（v3.2 移除「📄 PDF 修正」；`appState.activeTab`，产品变体页默认商品库 Tab，采购页默认 Excel） |
-| 入口选择器 | 步骤 0：单件📦 / 套装🎁 两张卡片（Excel 流用 `renderModePicker`），选中后锁入口，可「切换入口」重置 |
-| 步骤指示器 | Excel 区（v1.7.0）：① 上传转换版 Excel → ② 上传采购订单 Excel → ③ 预览确认（当前步紫色、已完成绿色、可点击回退） |
+| 双 Tab | 「🗂 供应商数据导入」/「🏷 商品库更新」（v3.8 由「📊 Excel 导入」改名；`appState.activeTab`，产品变体页默认商品库 Tab，采购页默认供应商导入） |
+| 入口选择器 | 步骤 0：单件📦 / 套装🎁 两张卡片（供应商数据导入区用 `renderModePicker`），选中后锁入口，可「切换入口」重置 |
+| 步骤指示器 | 供应商数据导入区：① 上传供应商数据（Excel/PDF 自动识别）→ ② 上传采购订单 Excel → ③ 预览确认（当前步紫色、已完成绿色、可点击回退） |
 | 常驻错误框 | `excelState.error`：解析失败时在卡片内红色常驻显示原因，下次成功自动清除 |
-| 预览 Modal | 92vw 宽居中弹窗，Excel 流用（v1.7.0 起统一 pdf 布局：数量核对/PDF Qty 列）；`mode` 优先取预览行自带标记；商品库更新 Modal（v1.11.0）：UPC + 中文简称/品牌 旧→新 对照 + 勾选写回。**预览 Odoo 查询缓存（v1.12.3）**：`buildPdfPreviewRows` 缓存 lineData，同一 changes（引用相同）重复预览不重查 Odoo（Modal 关闭重开/反复点预览秒开），数据重新生成（重新上传/合并）自动失效 |
+| 预览 Modal | 94vw 宽居中弹窗，数量核对/供应商 Qty 布局（PDF 与 Excel 来源统一展示）；`mode` 优先取预览行自带标记，兜底 `excelState.mode`；商品库更新 Modal（v1.11.0）：UPC + 中文简称/品牌 旧→新 对照 + 勾选写回。**预览 Odoo 查询缓存（v1.12.3）**：`buildPdfPreviewRows` 缓存 lineData，同一 changes（引用相同）重复预览不重查 Odoo（Modal 关闭重开/反复点预览秒开），数据重新生成（重新上传/合并）自动失效 |
 | 日志区 | 最近一次执行结果（成功/失败/跳过计数），可下载 JSON、清除 |
 | Toast / Loading | 右下角提示；顶部紫色 loading 胶囊（`updateLoadingOverlay`） |
 
@@ -392,21 +410,24 @@ odoowritting_extension/
 | 16 | Excel 导入支持多个转换版文件（列表可删 + 合并去重） | `excelState.convFiles`/`mergeConvFiles`/`mergeCoupon`/`finishConvFiles`/`removeConvFile` | ⚠️ v1.12.0 已实现（17 断言单测通过），待 Chrome 冒烟验证（多文件添加/删除、同 UPC 同包装 Qty 相加、Coupon 任一非0、双流回归） |
 | 17 | 数量列改「包装数量」+ 价格原值改比对 Odoo（2026-08-26 用户需求） | `EXCEL_COLS.boxQty`/`applyPdfSingle`/`applyPdfSet`/`buildPreviewRows`/`getOrderLines`/`fieldOrder` | ⚠️ v3.0（manifest v1.13.0）已实现：数量比对与写回用采购单 Excel「包装数量」列（abw交货箱数列作废）；价格原值（单价→price_unit、0.9箱规价→box_wholesale_price、0.9总价→price_subtotal）从 Odoo 订单行取，buildPreviewRows 命中后回填重算 changed/reason；箱规价字段移除；缺货判断 = 包装数量空/0。语法通过，待 Chrome 冒烟验证 |
 | 18 | modal 按订单关联分组小计（2026-08-27 用户需求） | `renderPdfPreviewTable`（tbody 分组插行）/`renderPdfGroupSubtotalRow`（组小计行，只累计 total09）/`refreshTotal`（组小计实时刷新） | ⚠️ v3.1（manifest v1.14.0）已实现：套装入口每组尾部插「{订单关联号} 小计」行，只对 0.9总价列组内合计（全部行）；单件入口不插；全表合计行保留。语法通过，待 Chrome 冒烟验证 |
-| 19 | 移除 PDF 修正入口（2026-08-27 用户需求） | `renderTabSwitch`/`renderCardContent`/`renderExcelZone`/`excelState`（pdfState、renderPdfZone、processPdfFile、extractPdfTable、parsePdf 等已删） | ✅ v3.2（manifest v1.15.0）已实现：Tab 剩 Excel 导入 + 商品库更新；manifest 移除 pdf.min.js/pdf.worker.min.js 加载（lib 文件保留）；共享的 applyPdfByMode/匹配/预览/写回链路由 Excel 流独占。语法通过，副本已同步，待 Chrome 冒烟 |
+| 19 | 移除 PDF 修正入口（2026-08-27 用户需求；**v3.8 部分回退，见 #25**） | `renderTabSwitch`/`renderCardContent`/`renderExcelZone`/`excelState`（pdfState、renderPdfZone、processPdfFile、extractPdfTable、parsePdf 等已删） | ✅ v3.2（manifest v1.15.0）已实现：Tab 剩 Excel 导入 + 商品库更新；manifest 移除 pdf.min.js/pdf.worker.min.js 加载（lib 文件保留）；共享的 applyPdfByMode/匹配/预览/写回链路由 Excel 流独占。语法通过，副本已同步 |
 | 20 | SKU 更新（2026-08-27 用户需求） | `PACKAGING_ODOO_FIELDS`/`loadPackagingByUpc`/`matchSkuPackaging`/`matchPdfToExcel`（matchLevel）/`applyPdfSingle`/`applyPdfSet`（skuUpdate）/`parseOrderExcel`（colIdxCatalog 按入口定列）/`buildPreviewRows`/`renderPdfPreviewRow`（SKU 列对照）/`executePdfUpdate` | ⚠️ v3.3 + v3.4（manifest v1.17.0）已实现：UPC 匹配成功行用转换 Excel SKU 更新 product.packaging——单件入口写 single_sku（不识别规格，qty=1 定位；SKU 列=「订单行/包装/SKU」）、套装入口按套装数量比对 XX 写 box_sku（SKU 列=「订单行/包装/Box SKU」）；SKU 列旧→新对照，变更默认勾选；失败文案拆 5 种；找不到规格跳过并提示。语法通过，副本已同步，待 Chrome 冒烟验证 |
 | 21 | modal 0.9总价 改动态计算列（2026-09-04 用户需求） | `applyPdfSingle`/`applyPdfSet`（total09 字段 = 价格×包装数量）/`fieldOrder`（单件入口也含 total09）/`renderPdfPreviewRow`（total09 readonly + 初始值取 newValue）/`recalcRowTotal`（新增：编辑 boxQty/价格 → 重算本行 total09）/`refreshTotal`（总和+组小计随动态值刷新） | ⚠️ v3.6（manifest v1.19.0）+ v3.6.1 补丁（manifest v1.19.1）已实现：0.9总价列两入口都展示（套装=0.9箱规价×包装数量、单件=单价×包装数量，2026-09-04 用户确认），readonly 动态重算；保留 Odoo price_subtotal 原值比对（不一致红框）；单件入口本次起同样插「订单关联 小计」行；total09 odooField=null 不写回。**v3.6.1 补丁（2026-09-04 用户需求）**：Odoo 匹配不上订单行的价格数据（oldValue 无回填）也照常显示计算值——新增 `fieldInitValue`（newValue 优先，无计算值退回 fieldDisplayVal），输入框初值与 colMaxLen 列宽统一用该口径（含 0.9总价/单价/0.9箱规价），无法比对原值的行不显示 Odoo 原值小字。语法通过，副本已同步，待 Chrome 冒烟验证 |
 | 22 | Odoo 行匹配加 supplierinfo.product_code 二级键（2026-09-04 用户需求，只读库验证后实施） | `searchPoByRef`（补 partner_id）/`getOrderLines(ids, partnerId)`（查模板级+变体级 supplierinfo → 行级 supplierCodes）/`loadOrderLineMap`（supMap/supCnt 次键注册，defaultCode 空但有 supplierCodes 的行不再丢弃）/`buildPreviewRows`（主键未命中 → 次键，包装精确+唯一兜底+多行防错配） | ⚠️ v3.7（manifest v1.20.0）已实现。验证依据（只读库 p169_erp，2026-09-04）：`8800366240575` 不在 default_code、在 `supplierinfo.product_code`（partner 1354 ABW，tmpl 8608/var 608，default_code=8800256119219）；全库 4096 行中 28 行 line.name 票据码 ≠ default_code，活跃单（purchase 11 + sent 2）13 行，样例 10/10 name `[码]` == supplierinfo.product_code。主键 default_code 优先、不中再按 PO 供应商的 supplierinfo.product_code（含包装精确/唯一兜底/多行报未找到，防错配）。语法通过，副本已同步，待 Chrome 冒烟验证（重点：P09770 等 ABW 单 medicube 防晒霜/TXA 精华行不再报未找到） |
 | 23 | 缺货①行「Odoo 原值」删除线小字残留非 0（2026-09-04 用户反馈） | `applyPdfSingle`/`applyPdfSet`（outstock① 分支 unitPrice 字段） | ✅ v3.7.1（manifest v1.20.1）已修复：kind=outstock 行 unitPrice 的 oldValue 原存采购单 Excel 单价列残留值（v3.0 已废 Excel 价格列作比对、kind=outstock 又故意不回填 Odoo 现值），渲染时被标成「Odoo 原值: 非0」小字误导（Odoo 已写 0 仍显示）。修复 = oldValue 置 null（缺货行价格不比对）。语法通过，副本已同步，待 Chrome 冒烟验证 |
 | 24 | 0.9总价比对实时化（2026-09-04 用户需求） | `renderPdfPreviewRow`（登记 _total09Box；total09「Odoo 原值」小字改动态、不走静态创建）/`recalcRowTotal`（重算值后触发实时比对）/新增 `syncTotal09Compare`（值 vs Odoo price_subtotal 原值动态红灰态 + 小字增删 + title） | ⚠️ v3.7.2（manifest v1.20.2）已实现：modal 里改包装数量/价格 → 0.9总价 重算后**立即与 Odoo price_subtotal 实时比对**——不一致：红框红底 + 动态删除线「Odoo 原值」小字 + title 说明；改到一致：恢复只读灰样式并移除小字；无 Odoo 原值可比对的行（匹配不上/缺货①）恒灰只展示计算值。语法通过，副本已同步，待 Chrome 冒烟验证 |
+| 25 | 恢复 PDF 解析 + 上传界面改「供应商数据导入」（2026-09-09 用户需求，git 提交 ee9b5bc^ 恢复） | `content.js`（extractPdfTable/extractCoupon/parsePdf 恢复；detectSupplierKind 自动识别 .pdf→parsePdf / .xlsx/.xls→parseConvertedPdfExcel；convFiles 条目加 kind；UI 文案/步骤1 上传区改「供应商数据」并支持 PDF/Excel 混合多文件）/`manifest.json`（重新加载 lib/pdf.min.js + web_accessible_resources 加 lib/pdf.worker.min.js） | ⚠️ v3.8（manifest v1.21.0）已实现：PDF 解析链从 v3.2 移除提交的父版本恢复并适配 v3.3-v3.7 演进后的代码；流程归一为 步骤1 供应商数据（自动识别路由）→ 步骤2 采购订单 Excel → 预览写回。语法检查通过，副本已同步，待 Chrome 冒烟验证（重点：文本型 PDF 直传解析行数/格式/Coupon、Excel/PDF 混合多文件合并、路由后匹配写回回归） |
+| 26 | Modal 内包装数量改 0 → 按缺货写回 + 供应商数据支持多选上传（2026-09-10 用户需求） | `isRowOutstock`（新增：源数据缺货 或 boxQty 空/0）/`syncRowOutstock`（新增：切换缺货态——快照 + 价格置 0 锁定 + 备注缺货 + 标红勾选 + 还原）/`setRowRemarkOutstock`/`setRowBoxWholesaleZero`/`buildFieldCell`+`mountFieldInput`（单格渲染抽取 + 动态补备注输入框）/`paintQtyCell`+`qtyCellTipHtml`+`paintPdfStats`（数量核对列/统计栏实时刷新）/`executePdfUpdate`（写入时兜底置 0）/`makeDropZone`（multi 参数：原生多选 + 拖入多文件 + 串行解析）/`applyPdfSingle`/`applyPdfSet`（outstock 分支记 `calcValue`） | ⚠️ v3.9（manifest v1.22.0）已实现：① modal 里把「包装数量」改成 0/空 → 该行按缺货处理（备注「缺货」+ 单价/0.9箱规价置 0 锁定，单件补 box_wholesale_price=0 写回；改回非 0 按快照/calcValue 还原）；源数据包装数量为 0 的匹配行同步显示「缺货」。② 供应商数据上传区支持一次多选/多文件拖入，逐个校验后串行解析合并。语法检查通过，副本已同步，待 Chrome 冒烟验证（重点：改 0 → 预览标红/数量核对显示缺货/确认写入后 Odoo 三字段为 0；改回非 0 还原；多选多个 PDF/Excel 混合合并） |
+| 27 | 预览报错「预览失败: fieldRow is not a function」（2026-09-10 用户反馈） | `buildFieldCell`（v3.9 从 `renderPdfPreviewRow` 抽出的单格渲染函数） | ✅ v3.9.1（manifest v1.22.1）已修复：`row._fieldRows[key] = fieldRow` 抽取时丢了行尾分号，下一行是 `(function (inp, fld) {...})(input, f)`（IIFE 以 `(` 开头），ASI 不插分号 → 被解析成 `fieldRow(function(){...})(input, f)` 调用 → TypeError。修复 = 补回分号（并加注释说明，全文件已扫描确认无同类隐患）。已用最小 DOM 桩跑通 modal 渲染 + 包装数量改 0/改回全流程（单件/套装两入口），副本已同步，待 Chrome 冒烟 |
 
 ---
 
 ## 10. 快速上手（新 Agent 3 分钟版）
 
 1. **只改一个文件**：`content.js`（IIFE 单文件）；字段映射在顶部两个常量对象
-2. **一条在线修正流程（v3.2 起；v1.7.0 双流，PDF 修正已移除）**：📊 Excel 导入（上传「PDF 转换版 Excel」**可多个（v1.12.0），合并去重后** → 上传采购订单 Excel → `applyPdfByMode` 匹配修正 → Modal 写回）；共用 `parseOrderExcel` / `loadOrderLineMap` / `buildPreviewRows` / Modal / `executePdfUpdate`
-3. **两级匹配（v2.0）**：PDF/转换版 Excel ↔ 采购单 Excel 先按 Catalog↔SKU 匹配，匹配不上的行走 UPC 匹配（同 UPC 多行用包装拆分：PDF 侧 description "(xN)"、Excel 侧包装列 pieces，拼成 `UPC+N` 精确配对；唯一 UPC 直接匹配）；数量核对按 matchKey（Catalog/UPC/拆分键）分组。**UPC+包装是 Odoo 匹配键（v1.9）**：Excel「内部参考号」+「订单行/包装」件数 ↔ Odoo `product.default_code` + `product_packaging_id.qty`；查 PO（=name）优先用「参考号」列、查不到再用「订单关联」列（v1.7.1）
+2. **一条在线修正流程（v3.8 起：供应商数据导入）**：🗂 供应商数据导入 → 步骤1 上传供应商数据（**PDF 或 PDF 转换版 Excel，自动识别路由**：.pdf → `parsePdf`/`extractPdfTable`；.xlsx/.xls → `parseConvertedPdfExcel`；**可多个混合（v1.12.0 多文件合并）**）→ 步骤2 上传采购订单 Excel → `applyPdfByMode` 匹配修正 → Modal 写回；共用 `parseOrderExcel` / `loadOrderLineMap` / `buildPreviewRows` / Modal / `executePdfUpdate`
+3. **两级匹配（v2.0）**：供应商数据 ↔ 采购单 Excel 先按 Catalog↔SKU 匹配，匹配不上的行走 UPC 匹配（同 UPC 多行用包装拆分：供应商侧 description "(xN)"、Excel 侧包装列 pieces，拼成 `UPC+N` 精确配对；唯一 UPC 直接匹配）；数量核对按 matchKey（Catalog/UPC/拆分键）分组。**UPC+包装是 Odoo 匹配键（v1.9）**：Excel「内部参考号」+「订单行/包装」件数 ↔ Odoo `product.default_code` + `product_packaging_id.qty`；查 PO（=name）优先用「参考号」列、查不到再用「订单关联」列（v1.7.1）
 4. **无构建、无测试**：改完同步到 `odoowritting_extension/` 子目录后到 Chrome 手动验证
-5. **v3.0 比对基准**：数量 = 采购单 Excel「包装数量」列（求和 vs PDF Qty，写回 product_packaging_qty）；价格原值 = Odoo 订单行（price_unit / box_wholesale_price / price_subtotal），采购单 Excel 价格列不再作比对基准；箱规价字段已移除
-6. **SKU 更新（v3.3）**：两级匹配中 UPC 匹配成功（SKU 匹配失败）→ 用转换 Excel SKU 更新 product.packaging——单件入口写 piece 规格的 `single_sku`；套装入口按套装数量（description xN）比对 "1 box of XX pieces" 写 `box_sku`；Modal SKU 列旧→新对照，变更默认勾选，找不到规格跳过并提示
+5. **v3.0 比对基准**：数量 = 采购单 Excel「包装数量」列（求和 vs 供应商 Qty，写回 product_packaging_qty）；价格原值 = Odoo 订单行（price_unit / box_wholesale_price / price_subtotal），采购单 Excel 价格列不再作比对基准；箱规价字段已移除
+6. **SKU 更新（v3.3）**：两级匹配中 UPC 匹配成功（SKU 匹配失败）→ 用供应商数据 SKU 更新 product.packaging——单件入口写 piece 规格的 `single_sku`；套装入口按套装数量（description xN）比对 "1 box of XX pieces" 写 `box_sku`；Modal SKU 列旧→新对照，变更默认勾选，找不到规格跳过并提示
 7. Git 提交必须过 commitlint（husky），格式 `type(scope): subject`

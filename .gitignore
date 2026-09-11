@@ -43,6 +43,6 @@ npm-debug.log*
 # WorkBuddy
 .workbuddy/
 odoowrittingFile/
-docs/使用手册.md
+docs/
 
 n8n-odoo-sku-update.workflow.json
