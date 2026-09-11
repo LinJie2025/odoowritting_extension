@@ -1,5 +1,5 @@
 /**
- * Odoo Excel Importer v3.9.1（modal 内包装数量改 0/空 → 该行按缺货写回；供应商数据多选上传；修复 buildFieldCell ASI 缺分号导致预览失败）
+ * Odoo Excel Importer v3.10.0（多店铺采同一商品按 ORDER NO 拆分匹配/判缺货：供应商数据提取 ORDER NO + 采购单 Excel「order no」列对齐，同单才匹配，对不上该单即缺货）
  *
  * 可拖动按钮 → 悬浮卡片(上传/标签/日志) → Modal(可最小化)
  */
@@ -40,7 +40,8 @@
     unitPrice: "单价",               // 单价 → price_unit
     remark: "备注",
     orderRef: "订单关联",
-    partnerRef: "参考号"             // 参考号（2026-08-19 新增：查 PO 优先用它，查不到再用订单关联；两者都匹配 Odoo name 字段）
+    partnerRef: "参考号",            // 参考号（2026-08-19 新增：查 PO 优先用它，查不到再用订单关联；两者都匹配 Odoo name 字段）
+    orderNo: "ABW订单号"             // ORDER NO（2026-09-11 新增：供应商单据号，对应 Odoo partner_ref；多店铺采同一商品时按它拆分匹配/判缺货；采购单列名 ABW订单号/ABW訂單號）
   }
 
   // 商品库更新（v1.11.0 新增）：商品库 Excel 表头列名（表头第 1 行，按名定位）
@@ -111,6 +112,15 @@
     if (val === null || val === undefined || val === "") return null
     var n = Number(val)
     return isNaN(n) ? null : n
+  }
+
+  // 归一化 ORDER NO（v3.10，2026-09-11 用户需求：多店铺采同一商品按 ORDER NO 拆分匹配）——
+  // 去非数字 + 去前导零，统一供应商 "ORDER NO.: 35960805" 与采购单 Excel「order no」列（数字单元格会丢前导零）后对齐
+  function normOrderNo(val) {
+    if (val === null || val === undefined) return ""
+    var s = String(val).trim()
+    var d = s.replace(/[^\d]/g, "")
+    return d.replace(/^0+/, "")
   }
 
   function formatPrice(val) {
@@ -551,10 +561,11 @@
       rows.push(row2)
     }
 
-    // 11. 输出：格式 + Coupon + 关键列
+    // 11. 输出：格式 + Coupon + ORDER NO + 关键列
     return {
       format: hasHsCode ? "B" : "A",
       coupon: extractCoupon(items),
+      orderNo: extractOrderNo(items),
       rows: rows.map(function (r) {
         return {
           upc: (r[upcCol] || "").trim(),
@@ -579,6 +590,22 @@
     if (!cands.length) return 0
     var v = parseFloat(cands[0].text.replace(/[^\d.-]/g, ""))
     return isNaN(v) ? 0 : v
+  }
+
+  // 从供应商 PDF 文本块提取 ORDER NO.（v3.10，2026-09-11 多店铺拆分匹配用）——
+  // "ORDER NO." 文本块：优先取同块内数字（"ORDER NO.: 35960805"），否则取同行右侧首个数字块
+  function extractOrderNo(items) {
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i]
+      if (!/ORDER\s*NO/i.test(it.text)) continue
+      var m = it.text.match(/\d{4,}/)
+      if (m) return normOrderNo(m[0])
+      var cands = items.filter(function (j) {
+        return j !== it && Math.abs(j.y - it.y) <= 5 && j.x0 >= it.x1 - 2 && /^\d/.test(j.text)
+      }).sort(function (a, b) { return a.x0 - b.x0 })
+      if (cands.length) return normOrderNo(cands[0].text)
+    }
+    return ""
   }
 
   // 用 pdfjs-dist 解析 PDF → 文本块 → 表格
@@ -675,7 +702,8 @@
       unitPrice: colIdx(EXCEL_COLS.unitPrice),
       remark: colIdx(EXCEL_COLS.remark),
       orderRef: colIdx(EXCEL_COLS.orderRef),
-      partnerRef: colIdx(EXCEL_COLS.partnerRef)
+      partnerRef: colIdx(EXCEL_COLS.partnerRef),
+      orderNo: colIdx(EXCEL_COLS.orderNo)
     }
     if (idx.upc < 0) idx.upc = colIdxFuzzy(["内部参考号", "UPC", "EAN"])
     // v3.0：包装数量列名变体兜底（用户确认表头「包装数量」；防带前缀/英文变体）
@@ -687,6 +715,15 @@
         var prh = header[prj]
         if (!prh || prh.indexOf("内部参考号") !== -1) continue
         if (prh.indexOf("参考号") !== -1 || /reference/i.test(prh)) { idx.partnerRef = prj; break }
+      }
+    }
+    // v3.10（2026-09-11）：order no 列模糊兜底——英文 "order no"（大小写/带点容忍）或中文「订单号/訂單號/订单编号/訂單編號」；
+    // 排除「订单关联」（已定位 orderRef）与「参考号」（partnerRef），避免误命中
+    if (idx.orderNo < 0) {
+      for (var noj = 0; noj < header.length; noj++) {
+        var noh = header[noj]
+        if (!noh || noh === EXCEL_COLS.orderRef || noh === EXCEL_COLS.partnerRef) continue
+        if (/order\s*no/i.test(noh) || noh.indexOf("订单号") !== -1 || noh.indexOf("訂單號") !== -1 || noh.indexOf("订单编号") !== -1 || noh.indexOf("訂單編號") !== -1) { idx.orderNo = noj; break }
       }
     }
     // v3.4：SKU 列按入口区分（单件/套装），找不到再回退旧「SKU_x」+ 通用兜底
@@ -713,10 +750,35 @@
         unitPrice: parseFloatNum(cell(row, idx.unitPrice)),
         remark: String(cell(row, idx.remark)).trim(),
         orderRef: String(cell(row, idx.orderRef)).trim(),
-        partnerRef: String(cell(row, idx.partnerRef)).trim()
+        partnerRef: String(cell(row, idx.partnerRef)).trim(),
+        orderNo: normOrderNo(cell(row, idx.orderNo))
       })
     }
     return result
+  }
+
+  // 从「PDF 转换版 Excel」网格提取 ORDER NO.（v3.10，2026-09-11 多店铺拆分匹配用）——
+  // 含 "ORDER NO" 的单元格：优先同格内数字，否则同行右侧、再同列下方（1~2 行）找数字
+  function extractOrderNoFromGrid(grid) {
+    function sv(v) { return (v === undefined || v === null) ? "" : String(v).trim() }
+    for (var r = 0; r < grid.length; r++) {
+      var row = grid[r] || []
+      for (var c = 0; c < row.length; c++) {
+        var v = sv(row[c])
+        if (!/ORDER\s*NO/i.test(v)) continue
+        var m = v.match(/\d{4,}/)
+        if (m) return normOrderNo(m[0])
+        for (var nc = c + 1; nc < row.length; nc++) {
+          var nm = sv(row[nc]).match(/\d{4,}/)
+          if (nm) return normOrderNo(nm[0])
+        }
+        for (var br = r + 1; br < grid.length && br < r + 3; br++) {
+          var bm = sv((grid[br] || [])[c]).match(/\d{4,}/)
+          if (bm) return normOrderNo(bm[0])
+        }
+      }
+    }
+    return ""
   }
 
   // 解析「PDF 转换版 Excel」（2026-08-19 Excel 入口改造：输出与 PDF 表格同构，供 applyPdfByMode 复用）
@@ -790,20 +852,24 @@
       }
     }
 
-    return { format: hasHsCode ? "B" : "A", coupon: coupon, rows: rows }
+    return { format: hasHsCode ? "B" : "A", coupon: coupon, orderNo: extractOrderNoFromGrid(grid), rows: rows }
   }
 
   // ── 多供应商数据文件合并（v1.12.0，2026-08-25 用户需求；v3.8 起 Excel 与 PDF 两种来源文件统一合并）──
-  // 同 UPC+包装去重（key 与 matchPdfToExcel 拆分键一致：UPC+description 的 "(xN)"，提取不到 = 原 UPC）；
+  // 同 ORDER NO + UPC+包装去重（key 与 matchPdfToExcel 拆分键一致：ORDER NO + UPC + description 的 "(xN)"，提取不到 = 原 UPC）；
   // 合并行 Qty 相加、Subtotal 相加（价格×箱数才与 0.9总价比对一致），UNIT PRICE/catalog/description 取第一个
+  // v3.10（2026-09-11 用户需求）：key 增加 ORDER NO 维度——不同店铺（不同 ORDER NO）采购同一种商品不再跨单合并，
+  // 各自保留独立行并携带 orderNo，供后续按 ORDER NO 限定匹配/判缺货
   function mergeConvFiles(files) {
     var map = {}, keys = []
     for (var f = 0; f < files.length; f++) {
+      var orderNo = files[f].orderNo || ""
       var rows = files[f].rows
       for (var i = 0; i < rows.length; i++) {
         var r = rows[i]
         var pn = extractDescPack(r.description)
-        var key = pn ? r.upc + "+" + pn : r.upc
+        var base = pn ? r.upc + "+" + pn : r.upc
+        var key = orderNo + "|" + base
         var t = map[key]
         if (t) {
           var q1 = parseInt(t.qty, 10), q2 = parseInt(r.qty, 10)
@@ -811,7 +877,7 @@
           var s1 = parseFloat(t.subtotal), s2 = parseFloat(r.subtotal)
           if (!isNaN(s1) && !isNaN(s2)) t.subtotal = String(s1 + s2)
         } else {
-          map[key] = { upc: r.upc, catalog: r.catalog, qty: r.qty, unitPrice: r.unitPrice, subtotal: r.subtotal, description: r.description }
+          map[key] = { orderNo: orderNo, upc: r.upc, catalog: r.catalog, qty: r.qty, unitPrice: r.unitPrice, subtotal: r.subtotal, description: r.description }
           keys.push(key)
         }
       }
@@ -837,39 +903,56 @@
     var pairs = []
     var matchedIdx = {}
 
+    // v3.10（2026-09-11 用户需求）：多店铺采同一商品按 ORDER NO 拆分匹配。
+    // 仅当供应商数据与采购单 Excel 两侧都提取到 orderNo 时才启用限定（缺一侧回退全局匹配，兼容旧数据/无 ORDER NO 样本）
+    var hasPdfOrder = false, hasExcelOrder = false
+    for (var oi = 0; oi < pdfRows.length; oi++) if (pdfRows[oi].orderNo) { hasPdfOrder = true; break }
+    for (var oj = 0; oj < excelRows.length; oj++) if (excelRows[oj].orderNo) { hasExcelOrder = true; break }
+    var scopeByOrder = hasPdfOrder && hasExcelOrder
+    // 匹配键前缀：启用时拼 ORDER NO（不同单的商品互不配对），否则返回原值（等价旧全局匹配）
+    function scopeKey(no, base) { return scopeByOrder ? (no || "") + "|" + base : base }
+
     // ── 第一级：SKU 匹配（Excel 行 SKU 有值才参与；每个 Excel 行最多配对一次）──
     // v3.3：pair 增加 matchLevel（'sku'/'upc'），UPC 匹配成功 = SKU 已变更，用于 SKU 更新写回
     var bySku = {}
     for (var i = 0; i < excelRows.length; i++) {
       var e = excelRows[i]
       if (!e.catalog) continue
-      if (!bySku[e.catalog]) bySku[e.catalog] = []
-      bySku[e.catalog].push(e)
+      var eKey = scopeKey(e.orderNo, e.catalog)
+      if (!bySku[eKey]) bySku[eKey] = []
+      bySku[eKey].push(e)
     }
     for (var j = 0; j < pdfRows.length; j++) {
       var p = pdfRows[j]
-      var skuHits = bySku[p.catalog] || []
+      var skuHits = bySku[scopeKey(p.orderNo, p.catalog)] || []
       for (var a = 0; a < skuHits.length; a++) {
         var ex = skuHits[a]
         if (matchedIdx[ex.rowIndex]) continue
         matchedIdx[ex.rowIndex] = true
-        pairs.push({ excel: ex, pdf: p, matchKey: p.catalog, matchLevel: "sku" })
+        pairs.push({ excel: ex, pdf: p, matchKey: scopeKey(p.orderNo, p.catalog), matchLevel: "sku" })
       }
     }
 
     // ── 第二级：UPC 匹配（含包装拆分）──
-    // 整体统计 UPC 出现次数（含已 SKU 匹配的行）：任一侧 >1 → 该 UPC 走包装拆分
+    // 整体统计 UPC 出现次数（含已 SKU 匹配的行；v3.10 按 ORDER NO 维度统计）：任一侧 >1 → 该 UPC 走包装拆分
     var upcCntPdf = {}, upcCntExcel = {}
     for (var c = 0; c < pdfRows.length; c++) {
       var u = pdfRows[c].upc
-      if (u) upcCntPdf[u] = (upcCntPdf[u] || 0) + 1
+      if (u) {
+        var uk = scopeKey(pdfRows[c].orderNo, u)
+        upcCntPdf[uk] = (upcCntPdf[uk] || 0) + 1
+      }
     }
     for (var d = 0; d < excelRows.length; d++) {
       var ue = excelRows[d].upc
-      if (ue) upcCntExcel[ue] = (upcCntExcel[ue] || 0) + 1
+      if (ue) {
+        var uk2 = scopeKey(excelRows[d].orderNo, ue)
+        upcCntExcel[uk2] = (upcCntExcel[uk2] || 0) + 1
+      }
     }
-    function needSplit(upc) {
-      return ((upcCntPdf[upc] || 0) > 1 || (upcCntExcel[upc] || 0) > 1)
+    function needSplit(orderNo, upc) {
+      var k = scopeKey(orderNo, upc)
+      return ((upcCntPdf[k] || 0) > 1 || (upcCntExcel[k] || 0) > 1)
     }
     // Excel 侧：剩余未匹配行，按 UPC 或「UPC+包装」建索引
     var byUpcKey = {}
@@ -877,31 +960,32 @@
       var er = excelRows[m]
       if (matchedIdx[er.rowIndex]) continue
       var ek = er.upc
-      if (needSplit(ek)) {
+      if (needSplit(er.orderNo, ek)) {
         var pkN = extractPackQty(er.pack)
         if (pkN) ek = ek + "+" + pkN
       }
-      if (!byUpcKey[ek]) byUpcKey[ek] = []
-      byUpcKey[ek].push(er)
+      var ekFull = scopeKey(er.orderNo, ek)
+      if (!byUpcKey[ekFull]) byUpcKey[ekFull] = []
+      byUpcKey[ekFull].push(er)
     }
     // PDF 侧：所有未配对完的 Excel 行均可继续被同 key 的 PDF 行配对（一个 PDF 行可对应多个订单关联行，v1.7.5 合并核对场景）
     for (var n = 0; n < pdfRows.length; n++) {
       var pr = pdfRows[n]
       var pk = pr.upc
-      if (needSplit(pk)) {
+      if (needSplit(pr.orderNo, pk)) {
         var pdN = extractDescPack(pr.description)
         if (pdN) pk = pk + "+" + pdN
       }
-      var upcHits = byUpcKey[pk] || []
+      var upcHits = byUpcKey[scopeKey(pr.orderNo, pk)] || []
       for (var b = 0; b < upcHits.length; b++) {
         var ex2 = upcHits[b]
         if (matchedIdx[ex2.rowIndex]) continue
         matchedIdx[ex2.rowIndex] = true
-        pairs.push({ excel: ex2, pdf: pr, matchKey: pk, matchLevel: "upc" })
+        pairs.push({ excel: ex2, pdf: pr, matchKey: scopeKey(pr.orderNo, pk), matchLevel: "upc" })
       }
     }
 
-    // 未匹配的 Excel 行 → 缺货（v2.0：拆分后仍匹配不上的同样归入缺货）
+    // 未匹配的 Excel 行 → 缺货（v2.0：拆分后仍匹配不上的同样归入缺货；v3.10：含 ORDER NO 对不上该单供应商数据的情况）
     var outstock = []
     for (var o = 0; o < excelRows.length; o++) {
       if (!matchedIdx[excelRows[o].rowIndex]) outstock.push(excelRows[o])
@@ -2395,7 +2479,7 @@
         showToast(excelState.error, "error")
         return
       }
-      excelState.convFiles.push({ name: file.name, kind: kind, rows: result.rows, format: result.format, coupon: result.coupon || 0 })
+      excelState.convFiles.push({ name: file.name, kind: kind, rows: result.rows, format: result.format, coupon: result.coupon || 0, orderNo: result.orderNo || "" })
       excelState.excelRows = null
       excelState.excelFileName = null
       excelState.changes = null
